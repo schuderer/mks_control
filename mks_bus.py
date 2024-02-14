@@ -53,7 +53,7 @@ INV_COMMANDS = {v["cmd"]: k for k, v in COMMANDS.items()}  # inverse lookup tabl
 
 
 class Message:
-    """Represents a MKS-SERVO CAN message to be sent or received."""
+    """Represents an MKS-SERVO CAN message to be sent or received."""
 
     def __init__(self, can_id, cmd: Union[str, int], values: Optional[List[int]] = None, is_rx=False):
         """Create an MKS CAN message to be sent or received.
@@ -93,7 +93,7 @@ class Message:
 
     @classmethod
     def from_can_msg(cls, msg: can.Message) -> Message:
-        """Create a MKS CAN message from a python-can message.
+        """Create an MKS CAN message from a python-can message.
         :param msg: A python-can message object.
         :return: An MKS CAN message object.
         """
@@ -171,19 +171,19 @@ class Message:
         print(cls(1, 0x31))
         print(cls(2, "encoder"))
         try:
-            _bla = cls(3, "encoder", [14])  # should raise valueerror
+            _bla = cls(3, "encoder", [14])  # should raise ValueError
             raise Exception(
-                f"Message(3, 'encoder', [14]) should have raised an error, but was succesfully constructed as {_bla}")
+                f"Message(3, 'encoder', [14]) should have raised an error, but was successfully constructed as {_bla}")
         except ValueError as e:
-            print(f"Succesfully triggered ValueError: {e}")
+            print(f"Successfully triggered ValueError: {e}")
         print(cls(4, "encoder", [14], is_rx=True))
         print(cls(5, "encoder_carry", [1, 2], is_rx=True))
         print(cls(7, "encoder_carry", []), "-->")
         print(cls(7, "encoder_carry", []).to_can_msg())
         msg1 = cls(6, "encoder_carry", [1, 2], is_rx=True)
-        canmsg1 = msg1.to_can_msg()
-        print(canmsg1)
-        msg2 = cls.from_can_msg(canmsg1)
+        can_msg1 = msg1.to_can_msg()
+        print(can_msg1)
+        msg2 = cls.from_can_msg(can_msg1)
         print(msg1, "=?=", msg2)
         assert msg1 == msg2, f"{msg1} and {msg2} should be equal"
         assert msg1 == cls(6, "encoder_carry", [1, 2],
@@ -211,7 +211,7 @@ class Bus:
         :param device: The device name of the CAN bus. Default is None, which will search for a serial device with
             `device_searchstr` in its name.
         :param bitrate: The bitrate of the CAN bus. Default is 500000.
-        :param device_searchstr: The string to search for in the device name (case insensitive). Default is "canable".
+        :param device_searchstr: The string to search for in the device name (case-insensitive). Default is "canable".
         :param kwargs: Additional keyword arguments to pass to the `can.interface.Bus` constructor.
         """
         if device is None:
