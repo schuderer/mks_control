@@ -1,0 +1,3 @@
+pyserial
+python-can[serial, pcan]
+pynput
