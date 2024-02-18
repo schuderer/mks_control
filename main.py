@@ -36,7 +36,7 @@ quit_app = False
 state = [STOPPED] * NUM_AXES
 next_command = ["stop" for _ in range(NUM_AXES)]
 active_axis = 0
-positions = [None] * NUM_AXES
+positions = [0] * NUM_AXES
 
 
 # Helpers
@@ -109,7 +109,7 @@ def update_state_from_devices():
         can_id = msg.can_id
         axis = canid2axis(can_id)
         if msg.cmd_str == "encoder":
-            positions[axis] = msg
+            positions[axis] = msg[0] / 0x4000 * 360
         elif msg.cmd_str == "move":
             # print(f"Move response: {msg}")
             move_state = msg[0]
@@ -152,17 +152,14 @@ if __name__ == "__main__":
                 if time.time() - tick > 0.1:
                     os.system('clear')
                     print("Known devices")
-                    for axis, message in enumerate(positions):
-                        angle = 0
-                        if message is not None and message.cmd_str == "encoder":
-                            angle = message[0]/0x4000*360 or 0
-                        print(f"{axis + 1}: {message} -- {angle:.1f}°")
+                    for axis, angle in enumerate(positions):
+                        print(f"{axis + 1}: {angle:.1f}°")
                     print("\n\n")
+                    print(f"Press up/down arrow keys to choose axis, left/right arrow keys to move, esc to quit.")
                     print_axes()
                     print("\n\n")
                     execute_transitions()
                     update_state_from_devices()
-                    print(f"\n\nPress up/down arrow keys to choose axis, left/right arrow keys to move, esc to quit.")
                     tick = time.time()
             except Exception as e:
                 stop_all()
