@@ -1,5 +1,7 @@
 import os
 import time
+import sys
+import termios
 from enum import Enum
 
 from pynput import keyboard
@@ -58,6 +60,7 @@ def on_press(key):
         next_command[active_axis] = "left"
     if key == keyboard.Key.right:
         next_command[active_axis] = "right"
+    termios.tcflush(sys.stdin, termios.TCIOFLUSH)
 
 
 def on_release(key):
@@ -79,6 +82,7 @@ def on_release(key):
     active_axis = active_axis % NUM_AXES
     if key == keyboard.Key.left or key == keyboard.Key.right:
         next_command[active_axis] = "stop"
+    termios.tcflush(sys.stdin, termios.TCIOFLUSH)
 
 
 def start_keyboard_listener():
@@ -101,9 +105,6 @@ def stop_all():
 
 
 def update_state_from_devices():
-    for axis in AXES:
-        bus.send(axis2canid(axis), "encoder")
-        bus.send(axis2canid(axis), "motor_status")
     time.sleep(0.05)
     for msg in bus.receive_all():
         can_id = msg.can_id
@@ -128,6 +129,9 @@ def update_state_from_devices():
                 state[axis] = MOVING
             elif motor_state == 3:
                 state[axis] = STOPPING
+    for axis in AXES:
+        bus.send(axis2canid(axis), "encoder")
+        bus.send(axis2canid(axis), "motor_status")
 
 
 def execute_transitions():
