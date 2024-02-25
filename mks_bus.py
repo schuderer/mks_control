@@ -16,7 +16,9 @@ It handles value conversion and checksum calculation.
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from copy import deepcopy
 
 import bitstring
@@ -25,6 +27,8 @@ from typing import Optional, Union, List
 
 import can
 from can import exceptions as can_exceptions  # noqa: F401
+
+logger = logging.getLogger(__name__)
 
 # CAN Message Structure
 #
@@ -221,6 +225,8 @@ COMMANDS = {  # From "MKS SERVO42&57D_CAN User Manual V1.0.3.pdf"
 }
 INV_COMMANDS = {v["cmd"]: k for k, v in COMMANDS.items()}  # inverse lookup table
 BIG_ENDIAN_WIDTH_REGEXP = re.compile(r'([^ ,]+be:?)(\d+)', flags=re.IGNORECASE)
+RECV_TIMEOUT = 0.01  # seconds
+WAIT_FOR_TIMEOUT = 5  # seconds
 
 
 def _unpack(fmt, bitstream):
@@ -324,7 +330,7 @@ class Message:
         """
         self.can_id: int = can_id
         self.cmd: int = cmd if isinstance(cmd, int) else COMMANDS[cmd]["cmd"]
-        self.cmd_str: int = cmd if isinstance(cmd, str) else INV_COMMANDS[cmd]
+        self.cmd_str: str = cmd if isinstance(cmd, str) else INV_COMMANDS[cmd]
         self.values = values if values is not None else []
         rx_or_tx_struct = "rx_struct" if is_rx else "tx_struct"
         val_struct = COMMANDS[self.cmd_str][rx_or_tx_struct]
@@ -342,7 +348,7 @@ class Message:
             swapped_rx_or_tx = "tx_struct" if is_rx else "rx_struct"
             other_val_structs = COMMANDS[self.cmd_str][swapped_rx_or_tx].split(",")
             other_val_structs = [v for v in other_val_structs if not v.lower().strip().startswith("pad")]
-            print(f"other_val_structs: {other_val_structs}")
+            # print(f"other_val_structs: {other_val_structs}")
             hint = ""
             if len(other_val_structs) == len(self.values):
                 hint = f" Maybe you meant to specify is_rx={not is_rx}, " \
@@ -387,13 +393,13 @@ class Message:
     #        bus.send(self.to_can_msg())
     #
     #    @classmethod
-    #    def receive(cls, bus: can.interface.Bus, timeout=0.01):
+    #    def receive(cls, bus: can.interface.Bus, timeout=RECV_TIMEOUT):
     #        can_msg = bus.recv(timeout=timeout)
     #        msg = cls.from_can_msg(can_msg)
     #        return msg
     #
     #    @classmethod
-    #    def recv(cls, bus: can.interface.Bus, timeout=0.01):
+    #    def recv(cls, bus: can.interface.Bus, timeout=RECV_TIMEOUT):
     #        return cls.receive(bus, timeout=timeout)
 
     def __str__(self):
@@ -486,6 +492,7 @@ class Bus:
         self.bitrate = bitrate
         self.bustype = bustype
         self._kwargs = kwargs
+        self._msg_buffer = []  # For functions like wait_for, we have to keep non-matching messages in a buffer
         self.bus = can.interface.Bus(bustype=self.bustype, channel=self.device, bitrate=self.bitrate, **self._kwargs)
 
     def close(self):
@@ -497,8 +504,8 @@ class Bus:
     def __exit__(self, exception_type, value, traceback):
         self.close()
 
-    def send(self, msg_or_can_id: Union[Message, can.Message, int], cmd: Optional[Union[str, int]] = None,
-             values: Optional[List[int]] = None):
+    def send(self, can_id_or_msg: Union[Message, can.Message, int], cmd: Optional[Union[str, int]] = None,
+             *values: Union[list[int, bool], int, bool]):
         """Send a message on the CAN bus.
 
         Examples:
@@ -512,29 +519,47 @@ class Bus:
         bus.send(msg)
         ```
 
-        :param msg_or_can_id: Either a Message object or a CAN ID (int).
+        :param can_id_or_msg: Either a CAN ID (int) or a complete Message object.
         :param cmd: The command string or integer.
         :param values: The values to send with the command.
         :return: The sent message.
         """
-        if isinstance(msg_or_can_id, Message):
-            msg = msg_or_can_id
-        elif isinstance(msg_or_can_id, can.Message):
-            msg = Message.from_can_msg(msg_or_can_id)
+        # For convenience, support both a list of values and values as *args
+        values = list(values)
+        if len(values) == 1:
+            if values[0] is None:
+                values = None
+            elif isinstance(values[0], (list, tuple)):
+                values = values[0]
+
+        if isinstance(can_id_or_msg, Message):
+            msg = can_id_or_msg
+        elif isinstance(can_id_or_msg, can.Message):
+            msg = Message.from_can_msg(can_id_or_msg)
         else:
-            can_id = msg_or_can_id
+            can_id = can_id_or_msg
             msg = Message(can_id, cmd, values)
         can_msg = msg.to_can_msg()
         self.bus.send(can_msg)
         return msg
 
-    def receive(self, timeout=0.01):
+    def ask(self, can_id_or_msg: Union[Message, can.Message, int], cmd: Optional[Union[str, int]] = None,
+            *values: Union[list[int, bool], int, bool], answer_pattern: Optional[list] = None, timeout=WAIT_FOR_TIMEOUT):
+        """Send a message and wait for a response. Combines `send` and `wait_for`.
+        See `send` and `wait_for` for more details.
+        """
+        sent_msg = self.send(can_id_or_msg, cmd, *values)
+        return self.wait_for(sent_msg, value_pattern=answer_pattern, timeout=timeout)
+
+    def receive(self, timeout=RECV_TIMEOUT):
         """Receive a message from the CAN bus.
         Blocking with timeout. If no message is received, returns None.
 
         :param timeout: The timeout in seconds. Default is 0.1. Use None for blocking indefinitely.
         :return: The received message, or None if no message was received within the timeout period.
         """
+        if self._msg_buffer:
+            return self._msg_buffer.pop(0)
         if self.bus.state != can.BusState.ACTIVE:
             state = "ERROR" if self.bus.state == can.BusState.ERROR else "PASSIVE"
             raise RuntimeError(f"Bus state is {state}. Is the device connected and powered?")
@@ -542,11 +567,11 @@ class Bus:
         msg = can_msg and Message.from_can_msg(can_msg)
         return msg
 
-    def recv(self, timeout=0.01):
+    def recv(self, timeout=RECV_TIMEOUT):
         """Alias for `receive`."""
         return self.receive(timeout=timeout)
 
-    def receive_all(self, timeout=0.01):
+    def receive_all(self, timeout=RECV_TIMEOUT):
         """Receive all messages from the CAN bus.
         Blocking with timeout. If no message is received, returns an empty list.
 
@@ -560,6 +585,69 @@ class Bus:
                 break
             msgs.append(msg)
         return msgs
+
+    def flush(self):
+        """Flush the receive buffer, discarding all messages."""
+        while self.receive(timeout=0.001):
+            pass
+
+    def wait_for(self, can_id_or_msg: Union[Message, can.Message, int], cmd: Optional[Union[str, int]] = None, value_pattern: Optional[list] = None, timeout=WAIT_FOR_TIMEOUT):
+        """Wait until a message from a CAN ID with a specific command is received (such as "encoder" or 0x31) or
+        until the timeout is reached (default: 5 seconds).
+
+        You can optionally specify a `value_pattern` list to match the message's values. None-entries in the pattern are
+        ignored. Note that this will examine and discard any preceding non-matching messages of the same CAN ID and
+        command. If you want more control over this, don't specify a pattern and check the received message yourself.
+
+        To easily wait for an answer to a message you just sent, you can pass the sent message object as
+        `can_id_or_msg` (it is returned by the `send` method), and it will match the CAN ID and command.
+
+        :param can_id_or_msg: Either a CAN ID (int) or a complete Message object.
+        :param cmd: The command to wait for for this CAN ID (not needed when a message object is provided).
+        :param value_pattern: Optional: A tuple of values to match in the message data. If not None, the message data must match all values in the tuple.
+        :param timeout: The maximum time to wait for a matching message.
+        :return: The first matching message that was received.
+
+        :raises TimeoutError: If no matching message was received within the timeout period.
+        """
+        if isinstance(can_id_or_msg, can.Message):
+            can_id_or_msg = Message.from_can_msg(can_id_or_msg)
+        if isinstance(can_id_or_msg, Message):
+            can_id = can_id_or_msg.can_id
+            cmd = can_id_or_msg.cmd_str or can_id_or_msg.cmd
+            # values != value_pattern, so this needs to be provided separately by the user if needed
+        else:
+            can_id = can_id_or_msg
+
+        # For convenience, if `value_pattern` is a single value, wrap it in a list
+        if value_pattern is not None:
+            value_pattern = list(value_pattern)
+
+        start_time = time.time()
+        got_command = False
+        values = None
+        while time.time() - start_time < timeout:
+            for msg in self.receive_all():
+                if msg.can_id != can_id:
+                    # Ignoring non-matching CAN ID
+                    self._msg_buffer.append(msg)
+                    continue
+                if cmd == msg.cmd or str(cmd).lower() == msg.cmd_str.lower():
+                    # Consuming all messages with matching command
+                    got_command = True
+                    values = msg.values
+                    if value_pattern is None or all([values[i] == v for i, v in enumerate(value_pattern) if v is not None]):
+                        # Got a match.
+                        return msg
+                    else:
+                        print(f"Discarded message {msg} while waiting for values {value_pattern}")
+                else:
+                    # Ignoring non-matching command
+                    self._msg_buffer.append(msg)
+            time.sleep(RECV_TIMEOUT)
+        hint = f" (got the command, but with values {values})" if got_command else ""
+        raise TimeoutError(f"Timeout after {timeout}s waiting for msg {can_id} '{cmd}' "
+                           f"and vals '{value_pattern}'{hint}")
 
     @property
     def commands(self):
