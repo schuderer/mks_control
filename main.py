@@ -95,33 +95,6 @@ def send_axes(axes_or_messages, cmd=None, values=None):
             bus.send(axis, cmd, values)
 
 
-# def wait_for(can_id: int, cmd: Union[str, int], value_pattern=None, timeout=5):
-#     """Wait until a message with a specific command name or number is received (such as "encoder" or 0x31).
-#     Warning: this discards all other messages in the buffer! (for now)
-#
-#     :param cmd_substring: The substring to look for in the message command.
-#     :param value_pattern: A tuple of values to match in the message data. If not None, the message data must match all values in the tuple.
-#     :param timeout: The maximum time to wait for the message.
-#     :return: The message that was received.
-#     """
-#     start_time = time.time()
-#     got_command = False
-#     values = None
-#     while time.time() - start_time < timeout:
-#         for msg in bus.receive_all():
-#             print(f"Received message {msg} while waiting for {can_id} {cmd} with values {value_pattern}")
-#             if msg.can_id != can_id:
-#                 continue
-#             if cmd == msg.cmd or str(cmd).lower() in msg.cmd_str.lower():
-#                 got_command = True
-#                 values = msg.values
-#                 if not value_pattern or all([values[i] == v for i, v in enumerate(value_pattern) if v is not None]):
-#                     return msg
-#         time.sleep(0.01)
-#     raise TimeoutError(f"Timeout after {timeout}s waiting for {can_id} cmd '{cmd}' and vals '{value_pattern}'"
-#                        f"{' (got the command, but with values ' + str(values) + ')' if got_command else ''}")
-
-
 def on_press(key):
     # print('{0} pressed'.format(key))
     if key == keyboard.Key.esc:
@@ -215,40 +188,6 @@ def update_state_from_devices():
         (lock_state,) = bus.ask(axis2canid(axis), "shaft_lock_status")
         axis_data[axis].update(shaft_lock=lock_state, timestamp=timestamp())
 
-    # for msg in bus.receive_all():
-    #     can_id = msg.can_id
-    #     axis = canid2axis(can_id)
-    #     if msg.cmd_str == "encoder":
-    #         angle = encoder_to_angle(msg[0])
-    #         axis_data[axis].update(angle=angle, timestamp=timestamp())
-    #     # elif msg.cmd_str == "move":
-    #     #     # print(f"Move response: {msg}")
-    #     #     move_state = msg[0]
-    #     #     if move_state == 0:
-    #     #         state[axis] = ERROR
-    #     #     elif move_state == 2:
-    #     #         state[axis] = STOPPED
-    #     elif msg.cmd_str == "motor_status":
-    #         # print(f"Motor status: {msg}")
-    #         motor_state = msg[0]
-    #         if motor_state == 0:
-    #             state[axis] = ERROR
-    #         elif motor_state == 1:
-    #             state[axis] = STOPPED
-    #         elif motor_state == 2 or motor_state == 4:
-    #             state[axis] = MOVING
-    #         elif motor_state == 3:
-    #             state[axis] = STOPPING
-    #         pretty_state = format(f"{state[axis]} ({motor_state})", "<12")
-    #         axis_data[axis].update(state=pretty_state, timestamp=timestamp())
-    #     elif msg.cmd_str == "shaft_lock_status":
-    #         lock_state = msg[0]
-    #         axis_data[axis].update(lock=lock_state, timestamp=timestamp())
-    # for axis in AXES:
-    #     bus.send(axis2canid(axis), "encoder")
-    #     bus.send(axis2canid(axis), "motor_status")
-    #     bus.send(axis2canid(axis), "shaft_lock_status")
-
 
 def timestamp():
     return datetime.utcnow().strftime("%H:%M:%S.%f")[:-3]
@@ -281,10 +220,7 @@ def sensorless_home(axis):
     try:
         can_id = axis2canid(axis)
         bus.send(can_id, "set_work_current", [550])
-        # bus.send(can_id, "set_shaft_lock", [True])
-        # bus.wait_for(can_id, "set_shaft_lock", [True])
         bus.ask(can_id, "set_shaft_lock", [True], answer_pattern=[True])
-        # bus.send(can_id, "release_shaft_lock")
         bus.ask(can_id, "release_shaft_lock")  # may also be False if already released, so no answer_pattern
         bus.send(can_id, "move", [AXES_HOMING_DIRECTION[axis], 250, 50])
 
@@ -296,27 +232,14 @@ def sensorless_home(axis):
                 bus.send(can_id, "move", [0, 0, 100])  # stop
                 raise HomingError(f"Homing movement of axis {axis} timed out. Consider increasing AXES_HOMING_TIMEOUT for this axis.")
             time.sleep(0.5)
-            # bus.send(can_id, "shaft_lock_status")
-            # responses = bus.receive_all()
-            # for msg in responses:
-            #     print(msg)
-            #     if msg.cmd_str == "shaft_lock_status" and msg[0]:
-            #         print(f"Axis {axis} locked")
-            #         locked = True
             locked_resp = bus.ask(can_id, "shaft_lock_status", timeout=0.2)
             if locked_resp[0]:
                 # print(f"Axis {axis} reached home position.")
                 locked = True
 
         print(f"Homed axis {axis}. Performing cleanup.")
-        # bus.send(can_id, "release_shaft_lock")
-        # bus.wait_for(can_id, "release_shaft_lock", [True])
         bus.ask(can_id, "release_shaft_lock", answer_pattern=[True])
-        # bus.send(can_id, "set_zero")
-        # bus.wait_for(can_id, "set_zero", [True])
         bus.ask(can_id, "set_zero", answer_pattern=[True])
-        # bus.send(can_id, "set_work_current", [AXES_CURRENT_LIMIT[axis]])
-        # bus.wait_for(can_id, "set_work_current", [True])
         bus.ask(can_id, "set_work_current", [AXES_CURRENT_LIMIT[axis]], answer_pattern=[True])
         time.sleep(0.25)
         print(f"Homed axis {axis}")
@@ -332,10 +255,8 @@ def home_all():
             continue
         can_id = axis2canid(axis)
         sensorless_home(axis)
-        # bus.send(can_id, "encoder")
-        # response = bus.wait_for(can_id, "encoder")
         (encoder_val,) = bus.ask(can_id, "encoder")
-        print(f"Axis {axis} homed and zeroed. Current angle: {encoder_to_angle(encoder_val)}")
+        print(f"Axis {axis} homed and zeroed. Current angle: {encoder_to_angle(encoder_val):.1f}°")
         bus.send(can_id, "move_to", [500, 50, angle_to_encoder(AXES_SAFE_HOMING_ANGLE[axis])])
         start_time = time.time()
         while True:
