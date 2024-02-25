@@ -175,18 +175,21 @@ def update_state_from_devices():
         return
     time.sleep(0.05)
     for axis in AXES:
-        (encoder,) = bus.ask(axis2canid(axis), "encoder")
-        angle = encoder_to_angle(encoder)
-        axis_data[axis].update(angle=angle, timestamp=timestamp())
+        try:
+            (encoder,) = bus.ask(axis2canid(axis), "encoder", timeout=0.1)
+            angle = encoder_to_angle(encoder)
+            axis_data[axis].update(angle=angle, timestamp=timestamp())
 
-        (motor_state,) = bus.ask(axis2canid(axis), "motor_status")
-        # 0: error, 1: stopped, 2: accelerate, 3: decelerate, 4: full speed, 5: homing
-        state[axis] = [ERROR, STOPPED, MOVING, STOPPING, MOVING, MOVING][motor_state]
-        pretty_state = format(f"{state[axis]} ({motor_state})", "<12")
-        axis_data[axis].update(state=pretty_state, timestamp=timestamp())
+            (motor_state,) = bus.ask(axis2canid(axis), "motor_status", timeout=0.1)
+            # 0: error, 1: stopped, 2: accelerate, 3: decelerate, 4: full speed, 5: homing
+            state[axis] = [ERROR, STOPPED, MOVING, STOPPING, MOVING, MOVING][motor_state]
+            pretty_state = format(f"{state[axis]} ({motor_state})", "<12")
+            axis_data[axis].update(state=pretty_state, timestamp=timestamp())
 
-        (lock_state,) = bus.ask(axis2canid(axis), "shaft_lock_status")
-        axis_data[axis].update(shaft_lock=lock_state, timestamp=timestamp())
+            (lock_state,) = bus.ask(axis2canid(axis), "shaft_lock_status", timeout=0.1)
+            axis_data[axis].update(shaft_lock=lock_state, timestamp=timestamp())
+        except TimeoutError as e:
+            print(f"No answer from CAN ID {axis2canid(axis)}: {e}")
 
 
 def timestamp():
@@ -297,7 +300,7 @@ if __name__ == "__main__":
                     print_devices()
                     print("\n\n")
                     print(f"Press up/down arrow keys to choose axis, left/right arrow keys to move, esc to quit.")
-                    print(f"'0' to set zero, 'l' to release lock, 'L' to release all locks.")
+                    print(f"'0' to set zero, 'l' to release lock, 'L' to release all locks, 'h' to home axis, 'H' to home all axes.")
                     print_axes()
                     print("\n\n")
                     execute_transitions()
