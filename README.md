@@ -45,6 +45,8 @@ with Bus() as bus:  # for any optional params see mks_bus.py
     # Example: Send a command to which you expect a response
     resp = bus.ask(1, 'encoder')
     print(f"Values property containing 1 value for encoder response: {resp.values}")
+    # (Note that even for simple commands that set parameters or so, you might want  
+    # to wait for confirmation before proceeding, so I like to use `ask()` there, too)
     
     # Example: Send a command to which you expect a more specific response
     # You can also specify a timeout (default 5s)
