@@ -558,13 +558,15 @@ class Bus:
         :param timeout: The timeout in seconds. Default is 0.1. Use None for blocking indefinitely.
         :return: The received message, or None if no message was received within the timeout period.
         """
-        if self._msg_buffer:
+        if len(self._msg_buffer) > 0:
             return self._msg_buffer.pop(0)
         if self.bus.state != can.BusState.ACTIVE:
             state = "ERROR" if self.bus.state == can.BusState.ERROR else "PASSIVE"
             raise RuntimeError(f"Bus state is {state}. Is the device connected and powered?")
         can_msg = self.bus.recv(timeout=timeout)
         msg = can_msg and Message.from_can_msg(can_msg)
+        # if msg:
+        #     print(f"RAW RECEIVE: {msg}")
         return msg
 
     def recv(self, timeout=RECV_TIMEOUT):
@@ -588,7 +590,7 @@ class Bus:
 
     def flush(self):
         """Flush the receive buffer, discarding all messages."""
-        while self.receive(timeout=0.001):
+        while self.receive(timeout=0.01):
             pass
 
     def wait_for(self, can_id_or_msg: Union[Message, can.Message, int], cmd: Optional[Union[str, int]] = None, value_pattern: Optional[list] = None, timeout=WAIT_FOR_TIMEOUT):
@@ -604,7 +606,10 @@ class Bus:
 
         :param can_id_or_msg: Either a CAN ID (int) or a complete Message object.
         :param cmd: The command to wait for for this CAN ID (not needed when a message object is provided).
-        :param value_pattern: Optional: A tuple of values to match in the message data. If not None, the message data must match all values in the tuple.
+        :param value_pattern: Optional: A list or tuple of values to match in the message data.
+                                        If not None, the message data must match all values in the tuple (logical AND).
+                                        None-entries in the pattern are ignored.
+                                        If a list of value patterns is provided, the any match of the value patterns counts as success (logical OR).
         :param timeout: The maximum time to wait for a matching message.
         :return: The first matching message that was received.
 
@@ -627,7 +632,10 @@ class Bus:
         got_command = False
         values = None
         while time.time() - start_time < timeout:
-            for msg in self.receive_all():
+            # print("pre-receive")
+            msgs = self.receive_all()
+            # print(f"post-receive: {msgs}")
+            for msg_idx, msg in enumerate(msgs):
                 if msg.can_id != can_id:
                     # Ignoring non-matching CAN ID
                     self._msg_buffer.append(msg)
@@ -636,11 +644,27 @@ class Bus:
                     # Consuming all messages with matching command
                     got_command = True
                     values = msg.values
-                    if value_pattern is None or all([values[i] == v for i, v in enumerate(value_pattern) if v is not None]):
-                        # Got a match.
+                    if value_pattern is None:
+                        # None matches anything
+                        self._msg_buffer.extend(msgs[msg_idx+1:])  # Regression: don't throw out remaining messages
                         return msg
                     else:
-                        print(f"Discarded message {msg} while waiting for values {value_pattern}")
+                        if len(value_pattern) > 0 and not isinstance(value_pattern[0], (list, tuple)):
+                            value_patterns = [value_pattern]
+                        else:
+                            value_patterns = value_pattern
+                        if len(value_patterns[0]) != len(values):
+                            raise ValueError(f"Value pattern length {len(value_patterns[0])} does not match message length {len(values)}")
+                        # print(f"Checking message {msg} for values {value_pattern}")
+                        # Work with list of value patterns, check if any of them match
+                        for pattern in value_patterns:
+                            # print(f"Checking pattern {pattern} against {values}")
+                            if all([values[i] == v for i, v in enumerate(pattern) if v is not None]):
+                                # Got a match.
+                                self._msg_buffer.extend(msgs[msg_idx + 1:])  # Regression: don't throw out remaining messages
+                                return msg
+                    print(f"Discarded message {msg} while waiting for values {value_pattern}")
+                    # print("(the current buffer is \n" + '\n'.join([str(m) for m in self._msg_buffer]))
                 else:
                     # Ignoring non-matching command
                     self._msg_buffer.append(msg)
