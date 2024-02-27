@@ -17,12 +17,12 @@ STOPPED = "stopped"
 MOVING = "moving"
 STOPPING = "stopping"
 HOMING = "homing"
+PLAYBACK = "playback"
 AXES_HOMING_DIRECTION = [-1, 1, 0, -1, 1, 1]  # 1 for CW, 0 for CCW, None for no homing, -1 for endstop homing
 AXES_ANGLE_RANGE = [4700, -32200, 22700, 1820, 2120, 2120]  # between 0 and this angle in degrees (may be negative)
 AXES_SAFE_HOMING_ANGLE = [AXES_ANGLE_RANGE[i] * factor for i, factor in enumerate([0, 0.25, 0.75, 0, 0.5, 0.5])]
 AXES_CURRENT_LIMIT = [2000, 1600, 1000, 600, 600, 600]  # in mA
-AXES_HOMING_TIMEOUT = [15, 25, 15, 15, 10, 10]
-# AXES_HOMING_PARAMS = [homeTrig 0: falling edge, 1: rising edge; homeDir: 0: CW, 1: CCW; homeSpeed: 0~3000 RPM; EndLimit: 0: disable, 1: enable
+AXES_HOMING_TIMEOUT = [25, 25, 15, 15, 10, 10]
 
 # State machine
 ACTIONS = {
@@ -34,6 +34,7 @@ ACTIONS = {
         "right":      (("move", [1, 600, 50]), MOVING),
         "home_axis":  (lambda axis: home(axis), HOMING),
         "home_all":   (lambda _: home_all(), HOMING),
+        "play_pause": (lambda _: play_pause(), PLAYBACK),
     },
     MOVING: {
         "stop":       (("move", [0, 0, 50]), STOPPING),
@@ -47,6 +48,9 @@ ACTIONS = {
     ERROR: {
         # No commands allowed, wait for reset
     },
+    PLAYBACK: {
+        "play_pause":  (("move", [0, 0, 50]), STOPPING),
+    }
 }
 
 # Globals
@@ -60,7 +64,7 @@ axis_data = [{
     "angle": None,
     "timestamp": None
 } for _ in range(NUM_AXES)]
-
+sequence = []  # Lists of lists of saved positions
 
 # Exceptions
 class HomingError(Exception):
@@ -141,6 +145,12 @@ def on_release(key):
     if key == keyboard.KeyCode.from_char('L'):
         for axis in AXES:
             bus.send(axis2canid(axis), "release_shaft_lock")
+    if key == keyboard.KeyCode.from_char('s'):
+        save_position()
+    if key == keyboard.KeyCode.from_char('p'):
+        next_command[active_axis] = "play_pause"
+    if key == keyboard.KeyCode.from_char('c'):
+        sequence.clear()
     termios.tcflush(sys.stdin, termios.TCIOFLUSH)
 
 
@@ -171,8 +181,42 @@ def stop_all():
         bus.send(axis2canid(axis), "move", [0, 0, 100])
 
 
+def save_position():
+    global sequence
+    sequence.append([axis_data[axis]["angle"] for axis in AXES])
+    print(f"Saved position {len(sequence)}")
+
+
+def play_pause():
+    bus.flush()
+    for axis in AXES:
+        if state[axis] == PLAYBACK:
+            stop_all()
+            state[axis] = STOPPED
+        else:
+            state[axis] = PLAYBACK
+    for i, position in enumerate(sequence):
+        print(f"Moving to position {i + 1}")
+        # Send all without waiting for answer to move all axes at the same time
+        for axis, angle in enumerate(position):
+            bus.send(axis2canid(axis), "move_to", [600, 50, angle_to_encoder(angle)])
+        # Wait for all axes to be done
+        # TODO: change movement speed so all axes are done at the same time and the movement through space is near-linear
+        for axis in AXES:
+            print(f"Waiting for axis {axis} to reach position {i + 1}")
+            # 0 and 2 are both valid results -- 0 = fail means we're already at position, 2 = moved successfully
+            resp = bus.wait_for(axis2canid(axis), "move_to", value_pattern=[[0], [2]], timeout=15)
+            print(f"Position {i + 1} reached: {resp}")
+        print(f"Position {i + 1} reached")
+        time.sleep(0.5)
+    # return to stopped status
+    for axis in AXES:
+        if state[axis] == PLAYBACK:
+            state[axis] = STOPPED
+
+
 def update_state_from_devices():
-    if any([state[axis] in [INIT, HOMING] for axis in AXES]):
+    if any([state[axis] in [INIT, HOMING, PLAYBACK] for axis in AXES]):
         return
     time.sleep(0.05)
     for axis in AXES:
@@ -243,16 +287,6 @@ def home(axis):
     bus.ask(can_id, "move_to",
             [500, 50, angle_to_encoder(AXES_SAFE_HOMING_ANGLE[axis])],
             answer_pattern=[2], timeout=AXES_HOMING_TIMEOUT[axis])
-    # bus.send(can_id, "move_to", [500, 50, angle_to_encoder(AXES_SAFE_HOMING_ANGLE[axis])])
-    # start_time = time.time()
-    # while True:
-    #     response = bus.wait_for(can_id, "move_to", timeout=AXES_HOMING_TIMEOUT[axis])
-    #     # print(f"Motor status: {response}")
-    #     if response[0] in [2, 3]:
-    #         break
-    #     elif response[0] == 0 or time.time() - start_time > AXES_HOMING_TIMEOUT[axis]:
-    #         raise HomingError(f"Homing of axis {axis} failed. Could not move to neutral position.")
-    #     time.sleep(0.1)
     if state[axis] == HOMING:
         state[axis] = STOPPED
 
@@ -328,6 +362,7 @@ if __name__ == "__main__":
                     print("\n\n")
                     print(f"Press up/down arrow keys to choose axis, left/right arrow keys to move, esc to quit.")
                     print(f"'0' to set zero, 'l' to release lock, 'L' to release all locks, 'h' to home axis, 'H' to home all axes.")
+                    print(f"'s' to save position in sequence, 'p' to play/pause sequence, 'c' to clear sequence.")
                     print_axes()
                     print("\n\n")
                     execute_transitions()
