@@ -17,11 +17,12 @@ STOPPED = "stopped"
 MOVING = "moving"
 STOPPING = "stopping"
 HOMING = "homing"
-AXES_HOMING_DIRECTION = [None, 1, 0, None, 1, 1]
+AXES_HOMING_DIRECTION = [-1, 1, 0, -1, 1, 1]  # 1 for CW, 0 for CCW, None for no homing, -1 for endstop homing
 AXES_ANGLE_RANGE = [4700, -32200, 22700, 1820, 2120, 2120]  # between 0 and this angle in degrees (may be negative)
 AXES_SAFE_HOMING_ANGLE = [AXES_ANGLE_RANGE[i] * factor for i, factor in enumerate([0, 0.25, 0.75, 0, 0.5, 0.5])]
 AXES_CURRENT_LIMIT = [2000, 1600, 1000, 600, 600, 600]  # in mA
 AXES_HOMING_TIMEOUT = [15, 25, 15, 15, 10, 10]
+# AXES_HOMING_PARAMS = [homeTrig 0: falling edge, 1: rising edge; homeDir: 0: CW, 1: CCW; homeSpeed: 0~3000 RPM; EndLimit: 0: disable, 1: enable
 
 # State machine
 ACTIONS = {
@@ -31,7 +32,7 @@ ACTIONS = {
     STOPPED: {
         "left":       (("move", [0, 600, 50]), MOVING),
         "right":      (("move", [1, 600, 50]), MOVING),
-        "home_axis":  (lambda axis: sensorless_home(axis), HOMING),
+        "home_axis":  (lambda axis: home(axis), HOMING),
         "home_all":   (lambda _: home_all(), HOMING),
     },
     MOVING: {
@@ -213,6 +214,49 @@ def execute_transitions():
             next_command[axis] = None  # Clear action if not changed by other thread
 
 
+def home(axis):
+    can_id = axis2canid(axis)
+    if AXES_HOMING_DIRECTION[axis] is None:  # Homing disabled
+        print(f"Axis {axis} currently does not support homing")
+        if state[axis] == HOMING:
+            state[axis] = STOPPED
+        return
+    elif AXES_HOMING_DIRECTION[axis] == -1:  # Native homing specified
+        try:
+            # If currently resting on endstop, move off the endstop for better accuracy
+            (_, _, _, active_low_endstop) = bus.ask(can_id, "io_status")
+            if not active_low_endstop:
+                bus.ask(can_id, "move_by", [60, 50, -3000], answer_pattern=[2])
+            # Home to endstop
+            bus.ask(can_id, "home", answer_pattern=[1])  # 1 = has started
+            bus.wait_for(can_id, "home", timeout=AXES_HOMING_TIMEOUT[axis], value_pattern=[2])
+        except TimeoutError as e:
+            raise HomingError(f"Endstop homing of axis {axis} timed out. "
+                              f"Consider increasing AXES_HOMING_TIMEOUT for this axis: {e}")
+    else:
+        # Sensorless homing
+        sensorless_home(axis)
+
+    # Move to neutral position
+    (encoder_val,) = bus.ask(can_id, "encoder")
+    print(f"Axis {axis} homed and zeroed. Current angle: {encoder_to_angle(encoder_val):.1f}°")
+    bus.ask(can_id, "move_to",
+            [500, 50, angle_to_encoder(AXES_SAFE_HOMING_ANGLE[axis])],
+            answer_pattern=[2], timeout=AXES_HOMING_TIMEOUT[axis])
+    # bus.send(can_id, "move_to", [500, 50, angle_to_encoder(AXES_SAFE_HOMING_ANGLE[axis])])
+    # start_time = time.time()
+    # while True:
+    #     response = bus.wait_for(can_id, "move_to", timeout=AXES_HOMING_TIMEOUT[axis])
+    #     # print(f"Motor status: {response}")
+    #     if response[0] in [2, 3]:
+    #         break
+    #     elif response[0] == 0 or time.time() - start_time > AXES_HOMING_TIMEOUT[axis]:
+    #         raise HomingError(f"Homing of axis {axis} failed. Could not move to neutral position.")
+    #     time.sleep(0.1)
+    if state[axis] == HOMING:
+        state[axis] = STOPPED
+
+
 def sensorless_home(axis):
     global state
     if AXES_HOMING_DIRECTION[axis] is None:
@@ -229,7 +273,7 @@ def sensorless_home(axis):
 
         start_time = time.time()
         locked = False
-        print(f"Homing axis {axis}")
+        print(f"Sensorless homing of axis {axis}")
         while not locked:
             if time.time() - start_time > AXES_HOMING_TIMEOUT[axis]:
                 bus.send(can_id, "move", [0, 0, 100])  # stop
@@ -247,29 +291,12 @@ def sensorless_home(axis):
         time.sleep(0.25)
         print(f"Homed axis {axis}")
     except TimeoutError as e:
-        raise HomingError(f"Error homing axis {axis}: {e}")
-    if state[axis] == HOMING:
-        state[axis] = STOPPED
+        raise HomingError(f"Error on sensorless homing of axis {axis}: {e}")
 
 
 def home_all():
     for axis in reversed(AXES):
-        if AXES_HOMING_DIRECTION[axis] is None:
-            continue
-        can_id = axis2canid(axis)
-        sensorless_home(axis)
-        (encoder_val,) = bus.ask(can_id, "encoder")
-        print(f"Axis {axis} homed and zeroed. Current angle: {encoder_to_angle(encoder_val):.1f}°")
-        bus.send(can_id, "move_to", [500, 50, angle_to_encoder(AXES_SAFE_HOMING_ANGLE[axis])])
-        start_time = time.time()
-        while True:
-            response = bus.wait_for(can_id, "move_to", timeout=AXES_HOMING_TIMEOUT[axis])
-            # print(f"Motor status: {response}")
-            if response[0] in [2, 3]:
-                break
-            elif response[0] == 0 or time.time() - start_time > AXES_HOMING_TIMEOUT[axis]:
-                raise HomingError(f"Homing of axis {axis} failed. Could not move to neutral position.")
-            time.sleep(0.1)
+        home(axis)
     print(f"All axes homed")
     # for axis in AXES:
     #     bus.send(axis2canid(axis), "move_to", [500, 50, angle_to_encoder(AXES_SAFE_HOMING_ANGLE[axis])])
