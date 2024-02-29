@@ -9,7 +9,7 @@ from typing import Optional
 from pynput import keyboard
 
 from arctos_arm import NUM_AXES, AXES_HOMING_DIRECTION, AXES_MOVE_TIMEOUT, AXES_SAFE_HOMING_ANGLE, AXES_CURRENT_LIMIT, \
-    AXES_ACCEL_LIMIT, AXES_SPEED_LIMIT, ARM_DEMO_SEQUENCE
+    AXES_ACCEL_LIMIT, AXES_SPEED_LIMIT, ARM_DEMO_SEQUENCE, HOMING_ORDER
 from mks_bus import Bus
 
 # Constants
@@ -34,6 +34,7 @@ ACTIONS = {
         "home_axis":  (lambda axis: home(axis), HOMING),
         "home_all":   (lambda _: home_all(), HOMING),
         "play_pause": (lambda _: play_pause(), PLAYBACK),
+        "input":      (lambda axis: input_angle(axis), STOPPED),
     },
     MOVING: {
         "stop":       (("move", [0, 0, 50]), STOPPING),
@@ -53,6 +54,7 @@ ACTIONS = {
 }
 
 # Globals
+keyboard_listener = None
 quit_app = False
 state = [STOPPED] * NUM_AXES
 next_command = ["init" for _ in range(NUM_AXES)]
@@ -157,15 +159,18 @@ def on_release(key):
         print("Clearing position sequence")
         time.sleep(0.5)
         sequence.clear()
+    if key == keyboard.Key.enter:
+        next_command[active_axis] = "input"
     termios.tcflush(sys.stdin, termios.TCIOFLUSH)
 
 
 def start_keyboard_listener():
     print("Keybard input active")
-    listener = keyboard.Listener(
+    global keyboard_listener
+    keyboard_listener = keyboard.Listener(
         on_press=on_press,
         on_release=on_release)
-    listener.start()
+    keyboard_listener.start()
 
 
 def print_axes():
@@ -185,6 +190,22 @@ def print_devices():
 def stop_all():
     for axis in AXES:
         bus.send(axis2canid(axis), "move", [0, 0, 100])
+
+
+def input_angle(axis):
+    keyboard_listener.stop()
+    time.sleep(1)
+    try:
+        new_angle = float(input(f"Enter angle for axis {active_axis}: "))
+    except ValueError:
+        print("Invalid angle")
+        time.sleep(1)
+        start_keyboard_listener()
+        return
+    bus.ask(axis2canid(active_axis), "move_to", [600, 50, angle_to_encoder(new_angle)], answer_pattern=[[0], [2], [3]],
+            timeout=AXES_MOVE_TIMEOUT[active_axis])
+    start_keyboard_listener()
+
 
 
 def save_position():
@@ -327,26 +348,80 @@ def move_to_position(position: list[int]):
     #
     # VIII in V:
     # vmax = tr * d / (tr^2 + tvmax * tr) = d / (tr + tvmax)      <-- new vmax
-    new_accelerations = [min(d / (slowest_ramp_time * (slowest_ramp_time + slowest_vmax_time)), amax) for d, amax in zip(distances, max_accelerations)]
+    new_accelerations_to_check = [min(d / (slowest_ramp_time * (slowest_ramp_time + slowest_vmax_time)), amax) for d, amax in zip(distances, max_accelerations)]
     print(f"old accelerations: {max_accelerations}")
-    print(f"{new_accelerations=}")
-    new_speeds = [min(a * slowest_ramp_time, vmax) for a, vmax in zip(new_accelerations, AXES_SPEED_LIMIT)]
+    print(f"{new_accelerations_to_check=}")
+    # Check accelerations for validity and fix them to bounds if needed (they must be usable by the MKS board)
+    constrained_accelerations = [constrain_rpm_accel(a) for a in new_accelerations_to_check]
+    print(f"{constrained_accelerations=}")
+    # Now the acceleration values are potentially so fast that we would arrive early. We release the limitation
+    # to match ramp times and need to adjust the ramp time tr and speed vmax so that the total time is correct.
+    # I   tt = tr + tvmax + tr
+    # II  d = dr + dvmax + dr
+    # III tr = sqrt(2 * dr / a)   and   dr = a * tr^2 / 2
+    # IV  tvmax = dvmax / vmax    and  dvmax = tvmax * vmax
+    # V   vmax = a * tr
+    # III, IV in I: tt = 2 * sqrt(2 * dr / a) + dvmax / vmax
+    # II:  dvmax = d - 2dr
+    #
+    # Geometric intuition  _________ (time/velocity chart where width is tt and area is d)
+    #                     /         \  ramp-up/down triangles together form a rectangle, vmax is also a rectangle
+    # d = tr * vmax/2 + tvmax * vmax + tr * vmax/2 = tr*vmax + tvmax*vmax
+    # tr = vmax / a --> substitute tr in d equation:
+    # d = vmax / a * vmax + tvmax*vmax = vmax^2/a + tvmax*vmax
+    # tvmax = tt - 2*tr  # Derived from tt = 2*tr + tvmax
+    # Substitute tr in tvmax equation:
+    # tvmax = tt - 2*vmax / a  --> Substitute tvmax in d equation:
+    # d = vmax^2/a + tvmax*vmax = vmax^2/a + (tt - 2*vmax / a) * vmax
+    # Try to solve for vmax:
+    # d = vmax^2/a + (tt - 2*vmax / a) * vmax
+    # vmax^2/a + (tt - 2*vmax / a) * vmax - d = 0
+    # 1/a * vmax^2 + tt * vmax - 2/a * vmax^2 - d = 0
+    # -1/a * vmax^2 + tt * vmax - d = 0   | * -1 to make it cleaner
+    #  1/a * vmax^2 - tt * vmax + d = 0
+    # Solve the quadratic equation:
+    #          + tt +/- sqrt(tt^2 - 4 * 1/a * d)
+    #  vmax =  ---------------------------------
+    #                       2 * 1/a
+    #
+    # = (tt +/- sqrt(tt^2 -4/a*d))*a / 2
+    vmax_solution = []
+    for tt, d, a, v_limit in zip(total_times, distances, constrained_accelerations, AXES_SPEED_LIMIT):
+        discriminant = tt**2 - 4/a*d
+        if discriminant < 0:
+            print(f"Could not find a solution for planning movement speed: {tt**2 - 4/a*d=} "
+                             f"(tt={tt}, d={d}, a={a}). Assuming max speed.")
+            solution = v_limit
+        else:
+            solution_1 = (tt - sqrt(discriminant))*a / 2
+            solution_2 = (tt + sqrt(discriminant))*a / 2
+            if 0 < solution_1 <= v_limit:
+                solution = solution_1
+            elif 0 < solution_2 <= v_limit:
+                solution = solution_2
+            else:
+                # At this point, we accept non-perfect syncing of speeds if v_limit would be exceeded
+                solution = min(max(solution_1, solution_2, 1), v_limit)
+            if solution <= 0:
+                raise ValueError(f"The solutions found for movement speed were negative.")
+        vmax_solution.append(solution)
+    new_speeds = vmax_solution
     print(f"old speeds: {AXES_SPEED_LIMIT}")
-    intermediary_speeds = [min(a * slowest_ramp_time, vmax) for a, vmax in zip(new_accelerations, AXES_SPEED_LIMIT)]
-    print(f"potential speeds: {intermediary_speeds}")
+    # intermediary_speeds = [min(a * slowest_ramp_time, vmax) for a, vmax in zip(intermediate_accelerations, AXES_SPEED_LIMIT)]
+    # print(f"potential speeds: {intermediary_speeds}")
     print(f"{new_speeds=}")
 
     # TODO: if acceleration is under the minimum threshold (which would make the mks acc value lower than 1), it currently
     # is capped at 1. This causes the axes to reach their target positions in different times.
-    # In this case, it would be preferable to increase the speed so that an acceleration value of 1 works for
+    # In this case, it would be preferable to DECREASE the speed so that an acceleration value of 1 works for
     # reaching the target at the same time as the slowest axis, even if the ramping would not be in sync any more.
 
     actually_moving = []
     for axis, angle in enumerate(position):
         speed = int(new_speeds[axis])
-        accel = rpm_accel_to_mks_accel(new_speeds[axis], fix_bounds=True)
+        accel = rpm_accel_to_mks_accel(constrained_accelerations[axis])
         if speed > 0.05:
-            print(f"{new_accelerations[axis]=} {[speed, accel, angle_to_encoder(angle)]=}")
+            print(f"{constrained_accelerations[axis]=} {[speed, accel, angle_to_encoder(angle)]=}")
             bus.send(axis2canid(axis), "move_to", [speed, accel, angle_to_encoder(angle)])
             actually_moving.append(axis)
     for axis in actually_moving:
@@ -487,7 +562,7 @@ def sensorless_home(axis):
 
 
 def home_all():
-    for axis in reversed(AXES):
+    for axis in HOMING_ORDER:
         home(axis)
     print(f"All axes homed")
     # for axis in AXES:
