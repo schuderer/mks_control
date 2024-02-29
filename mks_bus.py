@@ -505,7 +505,7 @@ class Bus:
         self.close()
 
     def send(self, can_id_or_msg: Union[Message, can.Message, int], cmd: Optional[Union[str, int]] = None,
-             *values: Union[list[int, bool], int, bool]):
+             *values: Union[list[Union[int, bool]], int, bool]):
         """Send a message on the CAN bus.
 
         Examples:
@@ -544,7 +544,7 @@ class Bus:
         return msg
 
     def ask(self, can_id_or_msg: Union[Message, can.Message, int], cmd: Optional[Union[str, int]] = None,
-            *values: Union[list[int, bool], int, bool], answer_pattern: Optional[list] = None, timeout=WAIT_FOR_TIMEOUT):
+            *values: Union[list[Union[int, bool]], int, bool], answer_pattern: Optional[list] = None, timeout=WAIT_FOR_TIMEOUT):
         """Send a message and wait for a response. Combines `send` and `wait_for`.
         See `send` and `wait_for` for more details.
         """
