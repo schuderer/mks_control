@@ -262,7 +262,7 @@ def rpm_accel_to_mks_accel(rpm_accel_value, fix_bounds=False) -> int:
     # mks_accel_value = 256.0 - 1.0 / (rpm_accel * acc_tick)
     upper_bound = 1.0 / ((256.0 - 255.0) * acc_tick)
     lower_bound = 1.0 / ((256.0 - 1.0) * acc_tick)
-    result_candidate = int(256.0 - 1.0 / (rpm_accel_value * acc_tick))
+    result_candidate = int(256.0 - 1.0 / (rpm_accel_value * acc_tick)) if rpm_accel_value > 0 else 0
     if result_candidate > 255:  #rpm_accel_value > upper_bound:
         if fix_bounds:
             return 0  # above-threshold acceleration = instant-speed mode
@@ -278,11 +278,11 @@ def rpm_accel_to_mks_accel(rpm_accel_value, fix_bounds=False) -> int:
 
 def move_to_position(position: list[int]):
     curr_pos = [0] * NUM_AXES
+    if None in position:
+        raise ValueError(f"Cannot move to {position}. It contains incomplete information.")
     for axis in AXES:
         (encoder_value,) = bus.ask(axis2canid(axis), "encoder")
         curr_pos[axis] = encoder_to_angle(encoder_value)
-    if None in position:
-        raise ValueError(f"Cannot move to {position}. It contains incomplete information.")
     # if None in curr_pos:
     #     raise ValueError(f"Cannot plan movement as the current position is not known completely: {curr_pos}")
 
@@ -351,77 +351,92 @@ def move_to_position(position: list[int]):
     new_accelerations_to_check = [min(d / (slowest_ramp_time * (slowest_ramp_time + slowest_vmax_time)), amax) for d, amax in zip(distances, max_accelerations)]
     print(f"old accelerations: {max_accelerations}")
     print(f"{new_accelerations_to_check=}")
-    # Check accelerations for validity and fix them to bounds if needed (they must be usable by the MKS board)
-    constrained_accelerations = [constrain_rpm_accel(a) for a in new_accelerations_to_check]
-    print(f"{constrained_accelerations=}")
-    # Now the acceleration values are potentially so fast that we would arrive early. We release the limitation
-    # to match ramp times and need to adjust the ramp time tr and speed vmax so that the total time is correct.
-    # I   tt = tr + tvmax + tr
-    # II  d = dr + dvmax + dr
-    # III tr = sqrt(2 * dr / a)   and   dr = a * tr^2 / 2
-    # IV  tvmax = dvmax / vmax    and  dvmax = tvmax * vmax
-    # V   vmax = a * tr
-    # III, IV in I: tt = 2 * sqrt(2 * dr / a) + dvmax / vmax
-    # II:  dvmax = d - 2dr
-    #
-    # Geometric intuition  _________ (time/velocity chart where width is tt and area is d)
-    #                     /         \  ramp-up/down triangles together form a rectangle, vmax is also a rectangle
-    # d = tr * vmax/2 + tvmax * vmax + tr * vmax/2 = tr*vmax + tvmax*vmax
-    # tr = vmax / a --> substitute tr in d equation:
-    # d = vmax / a * vmax + tvmax*vmax = vmax^2/a + tvmax*vmax
-    # tvmax = tt - 2*tr  # Derived from tt = 2*tr + tvmax
-    # Substitute tr in tvmax equation:
-    # tvmax = tt - 2*vmax / a  --> Substitute tvmax in d equation:
-    # d = vmax^2/a + tvmax*vmax = vmax^2/a + (tt - 2*vmax / a) * vmax
-    # Try to solve for vmax:
-    # d = vmax^2/a + (tt - 2*vmax / a) * vmax
-    # vmax^2/a + (tt - 2*vmax / a) * vmax - d = 0
-    # 1/a * vmax^2 + tt * vmax - 2/a * vmax^2 - d = 0
-    # -1/a * vmax^2 + tt * vmax - d = 0   | * -1 to make it cleaner
-    #  1/a * vmax^2 - tt * vmax + d = 0
-    # Solve the quadratic equation:
-    #          + tt +/- sqrt(tt^2 - 4 * 1/a * d)
-    #  vmax =  ---------------------------------
-    #                       2 * 1/a
-    #
-    # = (tt +/- sqrt(tt^2 -4/a*d))*a / 2
-    vmax_solution = []
-    for tt, d, a, v_limit in zip(total_times, distances, constrained_accelerations, AXES_SPEED_LIMIT):
-        discriminant = tt**2 - 4/a*d
-        if discriminant < 0:
-            print(f"Could not find a solution for planning movement speed: {tt**2 - 4/a*d=} "
-                             f"(tt={tt}, d={d}, a={a}). Assuming max speed.")
-            solution = v_limit
-        else:
-            solution_1 = (tt - sqrt(discriminant))*a / 2
-            solution_2 = (tt + sqrt(discriminant))*a / 2
-            if 0 < solution_1 <= v_limit:
-                solution = solution_1
-            elif 0 < solution_2 <= v_limit:
-                solution = solution_2
-            else:
-                # At this point, we accept non-perfect syncing of speeds if v_limit would be exceeded
-                solution = min(max(solution_1, solution_2, 1), v_limit)
-            if solution <= 0:
-                raise ValueError(f"The solutions found for movement speed were negative.")
-        vmax_solution.append(solution)
-    new_speeds = vmax_solution
-    print(f"old speeds: {AXES_SPEED_LIMIT}")
-    # intermediary_speeds = [min(a * slowest_ramp_time, vmax) for a, vmax in zip(intermediate_accelerations, AXES_SPEED_LIMIT)]
-    # print(f"potential speeds: {intermediary_speeds}")
-    print(f"{new_speeds=}")
 
-    # TODO: if acceleration is under the minimum threshold (which would make the mks acc value lower than 1), it currently
-    # is capped at 1. This causes the axes to reach their target positions in different times.
-    # In this case, it would be preferable to DECREASE the speed so that an acceleration value of 1 works for
-    # reaching the target at the same time as the slowest axis, even if the ramping would not be in sync any more.
+    complex_speed_adaption = False
+    if complex_speed_adaption:
+        # Check accelerations for validity and fix them to bounds if needed (they must be usable by the MKS board)
+        constrained_accelerations = [constrain_rpm_accel(a) for a in new_accelerations_to_check]
+        print(f"{constrained_accelerations=}")
+
+        # Now the acceleration values are potentially so fast that we would arrive early. We release the limitation
+        # to match ramp times and need to adjust the ramp time tr and speed vmax so that the total time is correct.
+        # I   tt = tr + tvmax + tr
+        # II  d = dr + dvmax + dr
+        # III tr = sqrt(2 * dr / a)   and   dr = a * tr^2 / 2
+        # IV  tvmax = dvmax / vmax    and  dvmax = tvmax * vmax
+        # V   vmax = a * tr
+        # III, IV in I: tt = 2 * sqrt(2 * dr / a) + dvmax / vmax
+        # II:  dvmax = d - 2dr
+        #
+        # Geometric intuition  _________ (time/velocity chart where width is tt and area is d)
+        #                     /         \  ramp-up/down triangles together form a rectangle, vmax is also a rectangle
+        # d = tr * vmax/2 + tvmax * vmax + tr * vmax/2 = tr*vmax + tvmax*vmax
+        # tr = vmax / a --> substitute tr in d equation:
+        # d = vmax / a * vmax + tvmax*vmax = vmax^2/a + tvmax*vmax
+        # tvmax = tt - 2*tr  # Derived from tt = 2*tr + tvmax
+        # Substitute tr in tvmax equation:
+        # tvmax = tt - 2*vmax / a  --> Substitute tvmax in d equation:
+        # d = vmax^2/a + tvmax*vmax = vmax^2/a + (tt - 2*vmax / a) * vmax
+        # Try to solve for vmax:
+        # d = vmax^2/a + (tt - 2*vmax / a) * vmax
+        # vmax^2/a + (tt - 2*vmax / a) * vmax - d = 0
+        # 1/a * vmax^2 + tt * vmax - 2/a * vmax^2 - d = 0
+        # -1/a * vmax^2 + tt * vmax - d = 0   | * -1 to make it cleaner
+        #  1/a * vmax^2 - tt * vmax + d = 0
+        # Solve the quadratic equation:
+        #          + tt +/- sqrt(tt^2 - 4 * 1/a * d)
+        #  vmax =  ---------------------------------
+        #                       2 * 1/a
+        #
+        # = (tt +/- sqrt(tt^2 -4/a*d))*a / 2
+        vmax_solution = []
+        for tt, d, a, v_limit in zip(total_times, distances, constrained_accelerations, AXES_SPEED_LIMIT):
+            discriminant = tt**2 - 4/a*d
+            if discriminant < 0:
+                print(f"Could not find a solution for planning movement speed: {tt**2 - 4/a*d=} "
+                                 f"(tt={tt}, d={d}, a={a}). Assuming max speed.")
+                solution = v_limit
+            else:
+                solution_1 = (tt - sqrt(discriminant))*a / 2
+                solution_2 = (tt + sqrt(discriminant))*a / 2
+                if 0 < solution_1 <= v_limit:
+                    solution = solution_1
+                elif 0 < solution_2 <= v_limit:
+                    solution = solution_2
+                else:
+                    # At this point, we accept non-perfect syncing of speeds if v_limit would be exceeded
+                    solution = min(max(solution_1, solution_2, 1), v_limit)
+                if solution <= 0:
+                    raise ValueError(f"The solutions found for movement speed were negative.")
+            vmax_solution.append(solution)
+        new_speeds = vmax_solution
+        print(f"old speeds: {AXES_SPEED_LIMIT}")
+        # intermediary_speeds = [min(a * slowest_ramp_time, vmax) for a, vmax in zip(intermediate_accelerations, AXES_SPEED_LIMIT)]
+        # print(f"potential speeds: {intermediary_speeds}")
+        print(f"{new_speeds=}")
+
+        new_accels = [rpm_accel_to_mks_accel(accel) for accel in constrained_accelerations]
+    else:
+        new_accels = []
+        new_speeds = []
+        for a, vmax, d in zip(new_accelerations_to_check, AXES_SPEED_LIMIT, distances):
+            try:
+                new_accels.append(rpm_accel_to_mks_accel(a, fix_bounds=False))
+                new_speeds.append(min(a * slowest_ramp_time, vmax))
+                print(f"calculation worked: new_accel={new_accels[-1]}, new_speed={new_speeds[-1]}")
+            except ValueError:
+                new_accels.append(0)  # instant-speed mode
+                new_speeds.append(min(d / total_times[slowest_axis_idx], vmax))  # linear scaling
+                print(f"fallback: new_accel={new_accels[-1]}, new_speed={new_speeds[-1]} (min({d}/{total_times[slowest_axis_idx]}, {vmax}))")
+
+    print(f"{new_accels=}")
+    print(f"{new_speeds=}")
 
     actually_moving = []
     for axis, angle in enumerate(position):
         speed = int(new_speeds[axis])
-        accel = rpm_accel_to_mks_accel(constrained_accelerations[axis])
+        accel = int(new_accels[axis])
         if speed > 0.05:
-            print(f"{constrained_accelerations[axis]=} {[speed, accel, angle_to_encoder(angle)]=}")
             bus.send(axis2canid(axis), "move_to", [speed, accel, angle_to_encoder(angle)])
             actually_moving.append(axis)
     for axis in actually_moving:
