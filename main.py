@@ -4,16 +4,15 @@ import sys
 import termios
 from datetime import datetime
 from math import sqrt
-from typing import Optional
+from typing import Optional, Any, Union
 
 from pynput import keyboard
 
-from arctos_arm import NUM_AXES, AXES_HOMING_DIRECTION, AXES_MOVE_TIMEOUT, AXES_SAFE_HOMING_ANGLE, AXES_CURRENT_LIMIT, \
-    AXES_ACCEL_LIMIT, AXES_SPEED_LIMIT, ARM_DEMO_SEQUENCE, HOMING_ORDER
+import arctos_arm as arm
 from mks_bus import Bus
 
 # Constants
-AXES = list(range(NUM_AXES))
+AXES = list(range(arm.NUM_AXES))
 ERROR = "error"
 INIT = "init"
 STOPPED = "stopped"
@@ -54,17 +53,17 @@ ACTIONS = {
 }
 
 # Globals
-keyboard_listener = None
+keyboard_listener: Optional[keyboard.Listener] = None
 quit_app = False
-state = [STOPPED] * NUM_AXES
-next_command = ["init" for _ in range(NUM_AXES)]
+state = [STOPPED] * arm.NUM_AXES
+next_command: list[Optional[str]] = ["init" for _ in range(arm.NUM_AXES)]
 active_axis = 0
-axis_data = [{
+axis_data: list[dict[str, Optional[Any]]] = [{
     "can_id": None,
     "state": None,
     "angle": None,
     "timestamp": None
-} for _ in range(NUM_AXES)]
+} for _ in range(arm.NUM_AXES)]
 sequence = []  # Lists of lists of saved positions
 
 # Exceptions
@@ -83,14 +82,25 @@ def canid2axis(can_id):
     return can_id - 1
 
 
-def encoder_to_angle(encoder_value):
+def encoder_to_motor_angle(encoder_value):
     """Convert encoder value to angle in degrees."""
     return encoder_value / 0x4000 * 360
 
 
-def angle_to_encoder(angle):
+def motor_angle_to_encoder(angle):
     """Convert angle in degrees to encoder value."""
     return int(angle / 360 * 0x4000)
+
+
+def joint_angles_rel(axis: Optional[int] = None, motor_angle: Union[float, list[float]] = None):
+    """Convert motor angle change in degrees to joint angle changes in degrees.
+    Provide either a list of motor angles for all axes, or an axis index and the angle change for that axis.
+    :param axis: index of the axis (if one single motor angle is specified)
+    :param motor_angle: angle change in degrees or a list of angle changes in degrees for all motor axes
+    """
+    if not isinstance(motor_angle, list):
+        motor_angle = [0 if a != axis else motor_angle for a in AXES]
+    return [motor_angle[a] / arm.AXES_ANGLE_RATIO[a] for a in AXES]
 
 
 def send_axes(axes_or_messages, cmd=None, values=None, answer_pattern=None):
@@ -135,7 +145,7 @@ def on_release(key):
     if key == keyboard.Key.down:
         next_command[active_axis] = "stop"
         active_axis -= 1
-    active_axis = active_axis % NUM_AXES
+    active_axis = active_axis % arm.NUM_AXES
     if key == keyboard.Key.left or key == keyboard.Key.right:
         next_command[active_axis] = "stop"
     if key == keyboard.KeyCode.from_char('0'):
@@ -202,8 +212,8 @@ def input_angle(axis):
         time.sleep(1)
         start_keyboard_listener()
         return
-    bus.ask(axis2canid(active_axis), "move_to", [600, 50, angle_to_encoder(new_angle)], answer_pattern=[[0], [2], [3]],
-            timeout=AXES_MOVE_TIMEOUT[active_axis])
+    bus.ask(axis2canid(active_axis), "move_to", [600, 50, motor_angle_to_encoder(new_angle)], answer_pattern=[[0], [2], [3]],
+            timeout=arm.AXES_MOVE_TIMEOUT[active_axis])
     start_keyboard_listener()
 
 
@@ -277,12 +287,12 @@ def rpm_accel_to_mks_accel(rpm_accel_value, fix_bounds=False) -> int:
 
 
 def move_to_position(position: list[int]):
-    curr_pos = [0] * NUM_AXES
+    curr_pos = [0] * arm.NUM_AXES
     if None in position:
         raise ValueError(f"Cannot move to {position}. It contains incomplete information.")
     for axis in AXES:
         (encoder_value,) = bus.ask(axis2canid(axis), "encoder")
-        curr_pos[axis] = encoder_to_angle(encoder_value)
+        curr_pos[axis] = encoder_to_motor_angle(encoder_value)
     # if None in curr_pos:
     #     raise ValueError(f"Cannot plan movement as the current position is not known completely: {curr_pos}")
 
@@ -292,10 +302,10 @@ def move_to_position(position: list[int]):
     distances = [abs(p - c)/360 for c, p in zip(curr_pos, position)]  # TODO check if needed: absolute because speed is separate from direction
     print(f"{distances=}")
     # Convert MKS so-called acceleration value that is unit-compatible with RPM (the MKS speed parameter)
-    max_accelerations = [mks_accel_to_rpm_accel(a) for a in AXES_ACCEL_LIMIT]
+    max_accelerations = [mks_accel_to_rpm_accel(a) for a in arm.AXES_ACCEL_LIMIT]
     print(f"{max_accelerations=}")
     # a = v / t => t = v / a
-    vmax_ramp_times_theoretical = [v / a for v, a in zip(AXES_SPEED_LIMIT, max_accelerations)]  # may exceed distance
+    vmax_ramp_times_theoretical = [v / a for v, a in zip(arm.AXES_SPEED_LIMIT, max_accelerations)]  # may exceed distance
     print(f"{vmax_ramp_times_theoretical=}")
     # # d = a * t^2 / 2 => t = sqrt(2 * d / a)
     # ramp_times = [sqrt(2 * d / 2) for d, a in zip(distances, AXES_ACCEL_LIMIT)]
@@ -309,7 +319,7 @@ def move_to_position(position: list[int]):
     ramp_times = [sqrt(2 * rd / a) for rd, a in zip(ramp_distances, max_accelerations)]
     print(f"{ramp_times=}")
     # v = d / t => t = d / v
-    vmax_times = [vd / v for vd, v in zip(vmax_distances, AXES_SPEED_LIMIT)]
+    vmax_times = [vd / v for vd, v in zip(vmax_distances, arm.AXES_SPEED_LIMIT)]
     print(f"{vmax_times=}")
     total_times = [2 * rt + vt for rt, vt in zip(ramp_times, vmax_times)]
     print(f"{total_times=}")
@@ -390,7 +400,7 @@ def move_to_position(position: list[int]):
         #
         # = (tt +/- sqrt(tt^2 -4/a*d))*a / 2
         vmax_solution = []
-        for tt, d, a, v_limit in zip(total_times, distances, constrained_accelerations, AXES_SPEED_LIMIT):
+        for tt, d, a, v_limit in zip(total_times, distances, constrained_accelerations, arm.AXES_SPEED_LIMIT):
             discriminant = tt**2 - 4/a*d
             if discriminant < 0:
                 print(f"Could not find a solution for planning movement speed: {tt**2 - 4/a*d=} "
@@ -410,7 +420,7 @@ def move_to_position(position: list[int]):
                     raise ValueError(f"The solutions found for movement speed were negative.")
             vmax_solution.append(solution)
         new_speeds = vmax_solution
-        print(f"old speeds: {AXES_SPEED_LIMIT}")
+        print(f"old speeds: {arm.AXES_SPEED_LIMIT}")
         # intermediary_speeds = [min(a * slowest_ramp_time, vmax) for a, vmax in zip(intermediate_accelerations, AXES_SPEED_LIMIT)]
         # print(f"potential speeds: {intermediary_speeds}")
         print(f"{new_speeds=}")
@@ -419,7 +429,7 @@ def move_to_position(position: list[int]):
     else:
         new_accels = []
         new_speeds = []
-        for a, vmax, d in zip(new_accelerations_to_check, AXES_SPEED_LIMIT, distances):
+        for a, vmax, d in zip(new_accelerations_to_check, arm.AXES_SPEED_LIMIT, distances):
             try:
                 new_accels.append(rpm_accel_to_mks_accel(a, fix_bounds=False))
                 new_speeds.append(min(a * slowest_ramp_time, vmax))
@@ -437,19 +447,19 @@ def move_to_position(position: list[int]):
         speed = int(new_speeds[axis])
         accel = int(new_accels[axis])
         if speed > 0.05:
-            bus.send(axis2canid(axis), "move_to", [speed, accel, angle_to_encoder(angle)])
+            bus.send(axis2canid(axis), "move_to", [speed, accel, motor_angle_to_encoder(angle)])
             actually_moving.append(axis)
     for axis in actually_moving:
         print(f"Waiting for axis {axis} to reach position")
         # 0 and 2 are both valid results -- 0 = fail means we're already at position, 2 = moved successfully
-        resp = bus.wait_for(axis2canid(axis), "move_to", value_pattern=[[0], [2]], timeout=AXES_MOVE_TIMEOUT[axis])
+        resp = bus.wait_for(axis2canid(axis), "move_to", value_pattern=[[0], [2]], timeout=arm.AXES_MOVE_TIMEOUT[axis])
         print(f"Axis {axis} reached position: {resp}")
 
 
 def play_pause():
     global sequence
     if len(sequence) == 0:
-        sequence = ARM_DEMO_SEQUENCE
+        sequence = arm.ARM_DEMO_SEQUENCE
     print(f"Playing/pausing sequence {sequence}")
     bus.flush()
     for axis in AXES:
@@ -461,16 +471,6 @@ def play_pause():
     for i, position in enumerate(sequence):
         print(f"Moving to position {i + 1}")
         move_to_position(position)
-        # Send all without waiting for answer to move all axes at the same time
-        # for axis, angle in enumerate(position):
-        #     bus.send(axis2canid(axis), "move_to", [600, 50, angle_to_encoder(angle)])
-        # # Wait for all axes to be done
-        # # TODO: change movement speed so all axes are done at the same time and the movement through space is near-linear
-        # for axis in AXES:
-        #     print(f"Waiting for axis {axis} to reach position {i + 1}")
-        #     # 0 and 2 are both valid results -- 0 = fail means we're already at position, 2 = moved successfully
-        #     resp = bus.wait_for(axis2canid(axis), "move_to", value_pattern=[[0], [2]], timeout=15)
-        #     print(f"Position {i + 1} reached: {resp}")
         print(f"Position {i + 1} reached")
         time.sleep(0.5)
     time.sleep(2)
@@ -487,7 +487,7 @@ def update_state_from_devices():
     for axis in AXES:
         try:
             (encoder,) = bus.ask(axis2canid(axis), "encoder", timeout=0.1)
-            angle = encoder_to_angle(encoder)
+            angle = encoder_to_motor_angle(encoder)
             axis_data[axis].update(angle=angle, timestamp=timestamp())
 
             (motor_state,) = bus.ask(axis2canid(axis), "motor_status", timeout=0.1)
@@ -508,12 +508,12 @@ def timestamp():
 
 def home(axis):
     can_id = axis2canid(axis)
-    if AXES_HOMING_DIRECTION[axis] is None:  # Homing disabled
+    if arm.AXES_HOMING_DIRECTION[axis] is None:  # Homing disabled
         print(f"Axis {axis} currently does not support homing")
         if state[axis] == HOMING:
             state[axis] = STOPPED
         return
-    elif AXES_HOMING_DIRECTION[axis] == -1:  # Native homing specified
+    elif arm.AXES_HOMING_DIRECTION[axis] == -1:  # Native homing specified
         try:
             # If currently resting on endstop, move off the endstop for better accuracy
             (_, _, _, active_low_endstop) = bus.ask(can_id, "io_status")
@@ -521,7 +521,7 @@ def home(axis):
                 bus.ask(can_id, "move_by", [60, 50, -3000], answer_pattern=[2])
             # Home to endstop
             bus.ask(can_id, "home", answer_pattern=[1])  # 1 = has started
-            bus.wait_for(can_id, "home", timeout=AXES_MOVE_TIMEOUT[axis], value_pattern=[2])
+            bus.wait_for(can_id, "home", timeout=arm.AXES_MOVE_TIMEOUT[axis], value_pattern=[2])
         except TimeoutError as e:
             raise HomingError(f"Endstop homing of axis {axis} timed out. "
                               f"Consider increasing AXES_HOMING_TIMEOUT for this axis: {e}")
@@ -531,17 +531,17 @@ def home(axis):
 
     # Move to neutral position
     (encoder_val,) = bus.ask(can_id, "encoder")
-    print(f"Axis {axis} homed and zeroed. Current angle: {encoder_to_angle(encoder_val):.1f}°")
+    print(f"Axis {axis} homed and zeroed. Current angle: {encoder_to_motor_angle(encoder_val):.1f}°")
     bus.ask(can_id, "move_to",
-            [500, 50, angle_to_encoder(AXES_SAFE_HOMING_ANGLE[axis])],
-            answer_pattern=[2], timeout=AXES_MOVE_TIMEOUT[axis])
+            [500, 50, motor_angle_to_encoder(arm.AXES_SAFE_HOMING_ANGLE[axis])],
+            answer_pattern=[2], timeout=arm.AXES_MOVE_TIMEOUT[axis])
     if state[axis] == HOMING:
         state[axis] = STOPPED
 
 
 def sensorless_home(axis):
     global state
-    if AXES_HOMING_DIRECTION[axis] is None:
+    if arm.AXES_HOMING_DIRECTION[axis] is None:
         print(f"Axis {axis} currently does not support homing")
         if state[axis] == HOMING:
             state[axis] = STOPPED
@@ -551,13 +551,13 @@ def sensorless_home(axis):
         bus.send(can_id, "set_work_current", [550])
         bus.ask(can_id, "set_shaft_lock", [True], answer_pattern=[True])
         bus.ask(can_id, "release_shaft_lock")  # may also be False if already released, so no answer_pattern
-        bus.send(can_id, "move", [AXES_HOMING_DIRECTION[axis], 250, 50])
+        bus.send(can_id, "move", [arm.AXES_HOMING_DIRECTION[axis], 250, 50])
 
         start_time = time.time()
         locked = False
         print(f"Sensorless homing of axis {axis}")
         while not locked:
-            if time.time() - start_time > AXES_MOVE_TIMEOUT[axis]:
+            if time.time() - start_time > arm.AXES_MOVE_TIMEOUT[axis]:
                 bus.send(can_id, "move", [0, 0, 100])  # stop
                 raise HomingError(f"Homing movement of axis {axis} timed out. Consider increasing AXES_HOMING_TIMEOUT for this axis.")
             time.sleep(0.5)
@@ -569,7 +569,7 @@ def sensorless_home(axis):
         print(f"Homed axis {axis}. Performing cleanup.")
         bus.ask(can_id, "release_shaft_lock", answer_pattern=[True])
         bus.ask(can_id, "set_zero", answer_pattern=[True])
-        bus.ask(can_id, "set_work_current", [AXES_CURRENT_LIMIT[axis]], answer_pattern=[True])
+        bus.ask(can_id, "set_work_current", [arm.AXES_CURRENT_LIMIT[axis]], answer_pattern=[True])
         time.sleep(0.25)
         print(f"Homed axis {axis}")
     except TimeoutError as e:
@@ -577,11 +577,11 @@ def sensorless_home(axis):
 
 
 def home_all():
-    for axis in HOMING_ORDER:
+    for axis in arm.HOMING_ORDER:
         home(axis)
     print(f"All axes homed")
     # for axis in AXES:
-    #     bus.send(axis2canid(axis), "move_to", [500, 50, angle_to_encoder(AXES_SAFE_HOMING_ANGLE[axis])])
+    #     bus.send(axis2canid(axis), "move_to", [500, 50, motor_angle_to_encoder(AXES_SAFE_HOMING_ANGLE[axis])])
     global state
     if any([state[axis] == HOMING for axis in AXES]):
         state = [STOPPED] * len(AXES)
@@ -611,7 +611,7 @@ def init(axis):
     bus.send(can_id, "set_response", [True])
     bus.ask(can_id, "set_shaft_lock", [True], answer_pattern=[True])
     bus.ask(can_id, "release_shaft_lock", answer_pattern=[None])
-    bus.ask(can_id, "set_work_current", [AXES_CURRENT_LIMIT[axis]], answer_pattern=[True])
+    bus.ask(can_id, "set_work_current", [arm.AXES_CURRENT_LIMIT[axis]], answer_pattern=[True])
     global state
     state[axis] = [STOPPED]
     # # for_all(lambda i: bus.send(i, "set_key_lock", [False]))  # what does this do?
