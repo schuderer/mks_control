@@ -233,6 +233,28 @@ class KinematicChain:
     def __init__(self, links: list[Link]):
         """Initialize a kinematic chain with a list of links"""
         self.links = links
+        self._current_visualization: Optional[plt.Axes] = None
+
+    @classmethod
+    def from_configuration(cls, arm) -> KinematicChain:
+        links = []
+        alpha_i_minus_1, a_i_minus_1 = 0, 0
+        for i, params in enumerate(arm.KINEMATIC_CHAIN):
+            alpha_i, a_i, theta_i, d_i = params
+            fixed = i in arm.FIXED_LINKS
+            print(f"Link {i + 1} params: {params}")
+            if arm.KINEMATIC_CONVENTION == OFFSET:
+                link = Link(alpha_i_minus_1, a_i_minus_1, theta_i, d_i, use_degrees=True, convention=MODIFIED,
+                            fixed=fixed)
+            else:
+                link = Link(alpha_i, a_i, theta_i, d_i, use_degrees=True,
+                            convention=arm.KINEMATIC_CONVENTION,
+                            fixed=fixed)
+            print(f"Link {i + 1}: {link}")
+            links.append(link)
+            alpha_i_minus_1 = alpha_i
+            a_i_minus_1 = a_i
+        return cls(links)
 
     def forward_kinematics(self, thetas: list[float], link_indices=None, fix_bounds=True) -> Matrix:
         """Calculate the forward kinematics for a given set of link angles"""
@@ -244,7 +266,7 @@ class KinematicChain:
             print(f"Result after link {i + 1}:\n{result}")
         return result
 
-    def visualize_link_angles(self, thetas: list[float], link_indices=None, fix_bounds=True, interactive=False) -> plt.Axes:
+    def visualize_link_angles(self, thetas: list[float], link_indices=None, fix_bounds=False, interactive=False, use_degrees=False) -> plt.Axes:
         """Visualize the link angles by showing small rgb coordinate system vectors (3 lines) for each link in a 3d plot,
         with the rgb lines' origin being translated correctly according to the link's transformation matrix,
         and the rgb lines' orientation being rotated according to the link's transformation matrix.
@@ -252,17 +274,17 @@ class KinematicChain:
         """
         fig = plt.figure()
         ax = fig.add_subplot(111, projection='3d')
-        self.update_visualization(ax, thetas, link_indices, fix_bounds)
+        self.update_visualization(thetas, link_indices=link_indices, fix_bounds=fix_bounds, use_degrees=use_degrees, axis_obj=ax)
         if interactive:
             plt.ion()
         plt.show()
-        print("3D plot displayed")
+        self._current_visualization = ax
         return ax
 
-    def update_visualization(self, axis_obj: plt.Axes, thetas: list[float], link_indices=None, fix_bounds=True):
+    def update_visualization(self, thetas: list[float], link_indices=None, fix_bounds=False, use_degrees=False, axis_obj: Optional[plt.Axes] = None):
         """Update the data in an existing plot.
         """
-        ax = axis_obj
+        ax = axis_obj or self._current_visualization
         ax.clear()
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
@@ -276,7 +298,8 @@ class KinematicChain:
         s = 80  # arrow scale factor
         result = Matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
         for i, (link, theta) in enumerate(zip(self.links, full_thetas)):
-            # result *= link(theta, fix_bounds)
+            if use_degrees:
+                theta = theta * pi / 180
             x, y, z = result.translation_vector
             r = result.rotation_matrix
             # First, add a label with the link number to the new origin
@@ -292,6 +315,15 @@ class KinematicChain:
         for xyz in range(3):
             ax.quiver(x, y, z, r[0][xyz] * s, r[1][xyz] * s, r[2][xyz] * s, color=['r', 'g', 'b'][xyz])
         # print("3D plot updated")
+
+    @staticmethod
+    def sleep(seconds: float):
+        """Sleep for a given number of seconds"""
+        plt.pause(seconds)
+
+    @staticmethod
+    def close_visualization():
+        plt.close()
 
     @staticmethod
     def _get_thetas_with_fixed_links(thetas: list[float], links: list[Link]) -> list[float]:
@@ -327,28 +359,7 @@ if __name__ == "__main__":
     # reload if already imported
     from importlib import reload
     reload(arctos_arm)
-    links = []
-    alpha_i_minus_1, a_i_minus_1 = 0, 0
-    for i, params in enumerate(arctos_arm.KINEMATIC_CHAIN):
-        alpha_i, a_i, theta_i, d_i = params
-        fixed = i in arctos_arm.FIXED_LINKS
-        print(f"Link {i+1} params: {params}")
-        if arctos_arm.KINEMATIC_CONVENTION == OFFSET:
-            link = Link(alpha_i_minus_1, a_i_minus_1, theta_i, d_i, use_degrees=True, convention=MODIFIED, fixed=fixed)
-        else:
-            link = Link(alpha_i, a_i, theta_i, d_i, use_degrees=True, convention=arctos_arm.KINEMATIC_CONVENTION, fixed=fixed)
-        print(f"Link {i+1}: {link}")
-        links.append(link)
-        alpha_i_minus_1 = alpha_i
-        a_i_minus_1 = a_i
-    chain = KinematicChain(links)
-    # chain = KinematicChain([Link(*params, use_degrees=True) for params in arctos_arm.KINEMATIC_CHAIN])
-    # chain = KinematicChain([
-    #     # Link(-90, 20.174, 0, 287.87, use_degrees=True),
-    #     # Link(0, 260.986, -90, 0, use_degrees=True),
-    #     Link(0, 0, 0, 287.87, use_degrees=True),
-    #     Link(-90, 20.174, -90, 0, use_degrees=True),
-    # ])
+    chain = KinematicChain.from_configuration(arctos_arm)
     print(chain)
     # Calculate the forward kinematics
     result = chain.forward_kinematics([0]*len(chain), fix_bounds=False)
@@ -358,7 +369,7 @@ if __name__ == "__main__":
     increment = 5 * pi / 180
     max_angle = pi / 4
     min_angle = -pi / 4
-    ax = chain.visualize_link_angles([0] * len(chain), fix_bounds=False, interactive=True)
+    chain.visualize_link_angles([0] * len(chain), fix_bounds=False, interactive=True)
     now = time.time()
     while time.time() - now < 10:
         plt.pause(0.1)
@@ -370,7 +381,7 @@ if __name__ == "__main__":
             elif theta_angle[i] < min_angle:
                 increment *= -1
                 theta_angle[i] = min_angle
-        chain.update_visualization(ax, theta_angle, fix_bounds=False)
+        chain.update_visualization(theta_angle, fix_bounds=False)
     plt.close()
 
     # fig = plt.figure()

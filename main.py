@@ -9,6 +9,7 @@ from typing import Optional, Any, Union
 from pynput import keyboard
 
 import arctos_arm as arm
+from kinematics import KinematicChain
 from mks_bus import Bus
 
 # Constants
@@ -92,15 +93,38 @@ def motor_angle_to_encoder(angle):
     return int(angle / 360 * 0x4000)
 
 
-def joint_angles_rel(axis: Optional[int] = None, motor_angle: Union[float, list[float]] = None):
+def joint_angles_rel(motor_angle: Union[float, list[float]], axis: Optional[int] = None):
     """Convert motor angle change in degrees to joint angle changes in degrees.
     Provide either a list of motor angles for all axes, or an axis index and the angle change for that axis.
-    :param axis: index of the axis (if one single motor angle is specified)
     :param motor_angle: angle change in degrees or a list of angle changes in degrees for all motor axes
+    :param axis: index of the axis (if one single motor angle is specified)
     """
     if not isinstance(motor_angle, list):
         motor_angle = [0 if a != axis else motor_angle for a in AXES]
-    return [motor_angle[a] / arm.AXES_ANGLE_RATIO[a] for a in AXES]
+    joint_angles = [0] * arm.NUM_AXES  # we're lucky in that num_motors = num_joints = NUM_AXES
+    for motor in AXES:
+        # print(f"{motor=}")
+        for joint in AXES:
+            # print(f"{joint=}")
+            motor_joint_ratio = arm.AXES_ANGLE_RATIO[motor][joint]
+            if motor_joint_ratio != 0:
+                # print(f"{joint_angles[joint]=} += {motor_angle[motor]=} / {motor_joint_ratio=}")
+                joint_angles[joint] += motor_angle[motor] / motor_joint_ratio
+                # print(f"{joint_angles[joint]=}")
+    # print(f"translated relative {motor_angle=} to {joint_angles=}")
+    return joint_angles
+
+
+def joint_angles_abs(motor_angle: Union[float, list[float]], axis: Optional[int] = None):
+    """Convert absolute motor angle in degrees to absolute joint angle in degrees.
+    Provide either a list of motor angles for all axes, or an axis index and the angle for that axis.
+    :param motor_angle: angle in degrees or a list of angles in degrees for all motor axes
+    :param axis: index of the axis (if one single motor angle is specified)
+    """
+    rel_angles = joint_angles_rel(motor_angle, axis=axis)
+    abs_angles = [a + offset for a, offset in zip(rel_angles, arm.JOINT_ZERO_OFFSET)]
+    # print(f"translated absolute {motor_angle=} to {abs_angles=}")
+    return abs_angles
 
 
 def send_axes(axes_or_messages, cmd=None, values=None, answer_pattern=None):
@@ -148,10 +172,10 @@ def on_release(key):
     active_axis = active_axis % arm.NUM_AXES
     if key == keyboard.Key.left or key == keyboard.Key.right:
         next_command[active_axis] = "stop"
-    if key == keyboard.KeyCode.from_char('0'):
-        stop_all()
-        for axis in AXES:
-            bus.ask(axis2canid(axis), "set_zero")
+    # if key == keyboard.KeyCode.from_char('0'):  # happens too often by accident
+    #     stop_all()
+    #     for axis in AXES:
+    #         bus.ask(axis2canid(axis), "set_zero")
     if key == keyboard.KeyCode.from_char('h'):
         next_command[active_axis] = "home_axis"
     if key == keyboard.KeyCode.from_char('H'):
@@ -206,7 +230,7 @@ def input_angle(axis):
     keyboard_listener.stop()
     time.sleep(1)
     try:
-        new_angle = float(input(f"Enter angle for axis {active_axis}: "))
+        new_angle = float(input(f"Enter MOTOR angle for axis {active_axis}: "))  # todo accept joint angles
     except ValueError:
         print("Invalid angle")
         time.sleep(1)
@@ -484,11 +508,12 @@ def update_state_from_devices():
     if any([state[axis] in [INIT, HOMING, PLAYBACK] for axis in AXES]):
         return
     time.sleep(0.05)
+    motor_angles = [0] * arm.NUM_AXES
     for axis in AXES:
         try:
             (encoder,) = bus.ask(axis2canid(axis), "encoder", timeout=0.1)
             angle = encoder_to_motor_angle(encoder)
-            axis_data[axis].update(angle=angle, timestamp=timestamp())
+            motor_angles[axis] = angle
 
             (motor_state,) = bus.ask(axis2canid(axis), "motor_status", timeout=0.1)
             # 0: error, 1: stopped, 2: accelerate, 3: decelerate, 4: full speed, 5: homing
@@ -500,6 +525,10 @@ def update_state_from_devices():
             axis_data[axis].update(shaft_lock=lock_state, timestamp=timestamp())
         except TimeoutError as e:
             print(f"No answer from CAN ID {axis2canid(axis)}: {e}")
+
+    joint_angles = joint_angles_abs(motor_angles)
+    for axis in AXES:
+        axis_data[axis].update(angle=joint_angles[axis], timestamp=timestamp())
 
 
 def timestamp():
@@ -522,6 +551,7 @@ def home(axis):
             # Home to endstop
             bus.ask(can_id, "home", answer_pattern=[1])  # 1 = has started
             bus.wait_for(can_id, "home", timeout=arm.AXES_MOVE_TIMEOUT[axis], value_pattern=[2])
+            bus.ask(can_id, "set_zero", answer_pattern=[True])  # this should not be necessary, but it is :(
         except TimeoutError as e:
             raise HomingError(f"Endstop homing of axis {axis} timed out. "
                               f"Consider increasing AXES_HOMING_TIMEOUT for this axis: {e}")
@@ -619,6 +649,8 @@ def init(axis):
 # Main
 if __name__ == "__main__":
     with Bus() as bus:
+        chain = KinematicChain.from_configuration(arm)
+        chain.visualize_link_angles([0] * len(chain), interactive=True)
         tick = time.time()
         start_keyboard_listener()
         while not quit_app:
@@ -634,8 +666,12 @@ if __name__ == "__main__":
                     print("\n\n")
                     execute_transitions()
                     update_state_from_devices()
+                    joint_angles = [axis_data[axis]["angle"] for axis in AXES]
+                    if not None in joint_angles:
+                        chain.update_visualization(joint_angles, use_degrees=True)
                     tick = time.time()
+                chain.sleep(0.05)
             except Exception as e:
                 stop_all()
                 raise e
-
+        chain.close_visualization()
