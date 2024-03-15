@@ -20,10 +20,11 @@ import logging
 import re
 import time
 from copy import deepcopy
+from queue import Empty, SimpleQueue
 
 import bitstring
 from serial.tools import list_ports
-from typing import Optional, Union, List
+from typing import Optional, Union, List, Any
 
 import can
 from can import exceptions as can_exceptions  # noqa: F401
@@ -461,10 +462,68 @@ class Message:
         assert cls(6, "encoder_carry", []) != cls(7, "encoder_carry", []), f"should not be equal"
 
 
+class MKSBufferedReader(can.Listener):
+    """Adapted from `python-can`'s `can.BufferedReader` class.
+    A BufferedReader is a subclass of :class:`~can.Listener` which implements a
+    **message buffer**: that is, when the :class:`can.BufferedReader` instance is
+    notified of a new message it pushes it into a queue of messages waiting to
+    be serviced. The messages can then be fetched with
+    :meth:`~can.BufferedReader.get_message`.
+
+    Putting in messages after :meth:`~can.BufferedReader.stop` has been called will raise
+    an exception, see :meth:`~can.BufferedReader.on_message_received`.
+
+    :attr is_stopped: ``True`` if the reader has been stopped
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # set to "infinite" size
+        self.buffer: SimpleQueue[Message] = SimpleQueue()
+        self.is_stopped: bool = False
+
+    def on_message_received(self, can_msg: can.Message) -> None:
+        """Append a message to the buffer.
+
+        :raises: BufferError
+            if the reader has already been stopped
+        """
+        if self.is_stopped:
+            raise RuntimeError("reader has already been stopped")
+        else:
+            try:
+                msg = Message.from_can_msg(can_msg)
+                self.buffer.put(msg)
+            except Exception as e:
+                print(f"MKSBufferedReader ignoring CAN Message {can_msg} because: {e}")
+
+    def get_message(self, timeout: float = RECV_TIMEOUT) -> Optional[Message]:
+        """
+        Attempts to retrieve the message that has been in the queue for the longest amount
+        of time (FIFO). If no message is available, it blocks for given timeout or until a
+        message is received (whichever is shorter), or else returns None. This method does
+        not block after :meth:`can.BufferedReader.stop` has been called.
+
+        :param timeout: The number of seconds to wait for a new message.
+        :return: the received :class:`can.Message` or `None`, if the queue is empty.
+        """
+        try:
+            if self.is_stopped:
+                return self.buffer.get(block=False)
+            else:
+                return self.buffer.get(block=True, timeout=timeout)
+        except Empty:
+            return None
+
+    def stop(self) -> None:
+        """Prohibits any more additions to this reader."""
+        self.is_stopped = True
+
+
 class Bus:
     """A class and contextmanager for managing a CAN bus of MKS SERVO devices."""
 
-    def __init__(self, bustype='slcan', device: Optional[str] = None, bitrate=500000, device_searchstr="canable",
+    def __init__(self, bustype_or_bus: Union[str, can.BusABC] = 'slcan', device: Optional[str] = None, bitrate=500000, device_searchstr="canable",
                  **kwargs):
         """Initializes a CAN bus of MKS SERVO devices.
 
@@ -477,26 +536,44 @@ class Bus:
             print(msg)
         ```
 
-        :param bustype: The type of CAN bus to use. Default is 'slcan'.
+        This class ignores messages from non-MKS-Servo devices. If you have a mix MKS Servo devices with other
+        CAN devices on the same bus, please attach a python-can Listener, e.g. can.BufferedReader,
+        to the python-can bus:
+
+        ```python
+        with Bus() as bus:
+            reader = can.BufferedReader
+            can.Notifier(bus.bus, [reader])
+            mks_msg = bus.recv()
+            other_msg = reader.get_message()
+        ```
+
+        :param bustype_or_bus: The type of CAN bus to use. Default is 'slcan'. Can also be an existing `can.BusABC` object.
         :param device: The device name of the CAN bus. Default is None, which will search for a serial device with
             `device_searchstr` in its name.
         :param bitrate: The bitrate of the CAN bus. Default is 500000.
         :param device_searchstr: The string to search for in the device name (case-insensitive). Default is "canable".
         :param kwargs: Additional keyword arguments to pass to the `can.interface.Bus` constructor.
         """
-        if device is None:
-            device = self._find_device(substr=device_searchstr)
+        if isinstance(bustype_or_bus, can.BusABC):
+            self.bus = bustype_or_bus
+        else:
             if device is None:
-                raise RuntimeError(f"No serial CAN device with {device_searchstr} in its name. Is it plugged in?")
-        self.device = device
-        self.bitrate = bitrate
-        self.bustype = bustype
-        self._kwargs = kwargs
-        self._msg_buffer = []  # For functions like wait_for, we have to keep non-matching messages in a buffer
-        self.bus = can.interface.Bus(bustype=self.bustype, channel=self.device, bitrate=self.bitrate, **self._kwargs)
+                device = self._find_device(substr=device_searchstr)
+                if device is None:
+                    raise RuntimeError(f"No serial CAN device with {device_searchstr} in its name. Is it plugged in?")
+            self.device = device
+            self.bitrate = bitrate
+            self.bustype = bustype_or_bus
+            self._kwargs = kwargs
+            self._msg_buffer = []  # For functions like wait_for, we have to keep non-matching messages in a buffer
+            self.bus = can.interface.Bus(bustype=self.bustype, channel=self.device, bitrate=self.bitrate, **self._kwargs)
+        self.reader = MKSBufferedReader()
+        can.Notifier(self.bus, [self.reader])
 
     def close(self):
         self.bus.shutdown()
+        self.reader.stop()
 
     def __enter__(self):
         return self
@@ -549,6 +626,7 @@ class Bus:
         See `send` and `wait_for` for more details.
         """
         sent_msg = self.send(can_id_or_msg, cmd, *values)
+        # print(f"ask: {cmd=}, {sent_msg=}")
         return self.wait_for(sent_msg, value_pattern=answer_pattern, timeout=timeout)
 
     def receive(self, timeout=RECV_TIMEOUT):
@@ -563,10 +641,11 @@ class Bus:
         if self.bus.state != can.BusState.ACTIVE:
             state = "ERROR" if self.bus.state == can.BusState.ERROR else "PASSIVE"
             raise RuntimeError(f"Bus state is {state}. Is the device connected and powered?")
-        can_msg = self.bus.recv(timeout=timeout)
-        msg = can_msg and Message.from_can_msg(can_msg)
+        # can_msg = self.bus.recv(timeout=timeout)
+        # msg = can_msg and Message.from_can_msg(can_msg)
         # if msg:
         #     print(f"RAW RECEIVE: {msg}")
+        msg = self.reader.get_message(timeout=timeout)
         return msg
 
     def recv(self, timeout=RECV_TIMEOUT):
@@ -615,6 +694,7 @@ class Bus:
 
         :raises TimeoutError: If no matching message was received within the timeout period.
         """
+        # print(f"wait_for: {can_id_or_msg=}, {cmd=}, {value_pattern=}, {timeout=}")
         if isinstance(can_id_or_msg, can.Message):
             can_id_or_msg = Message.from_can_msg(can_id_or_msg)
         if isinstance(can_id_or_msg, Message):
