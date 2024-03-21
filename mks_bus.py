@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # ID + Mode + Speed + Acceleration + Position + CRC
 #
 #    ID: 2 bytes - ID 01 to ID 06 (set on MKS SERVO42D_CAN and SERVO57D_CAN boards)
-#    Mode: 1 byte - F5 for absolute axis
+#    Mode: 1 byte - F5 for absolute joint
 #    Speed: 2 bytes
 #    Acceleration: Configured as 02 (default)
 #    Position: Converted from G-code
@@ -169,7 +169,7 @@ COMMANDS = {  # From "MKS SERVO42&57D_CAN User Manual V1.0.3.pdf"
         "tx_struct": "",  # nothing to send
         "rx_struct": "uintbe8",  # Status: 0: failed, 1: started, 2: success
     },
-    "set_zero": {  # Zero the axis
+    "set_zero": {  # Zero the joint
         "cmd": 0x92,
         "tx_struct": "",  # nothing to send
         "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail

@@ -2,6 +2,7 @@ import os
 import time
 import sys
 import termios
+
 from datetime import datetime
 from math import sqrt
 from typing import Optional, Any, Union
@@ -9,7 +10,7 @@ from typing import Optional, Any, Union
 from pynput import keyboard
 
 import arctos_arm as arm
-from kinematics import KinematicChain
+from kinematics import KinematicChain, Matrix
 from mks_bus import Bus
 
 # Constants
@@ -35,6 +36,7 @@ ACTIONS = {
         "home_all":   (lambda _: home_all(), HOMING),
         "play_pause": (lambda _: play_pause(), PLAYBACK),
         "input":      (lambda axis: input_angle(axis), STOPPED),
+        "move_all_to_zero": (lambda _: move_to_position(motor_angles_abs([0] * arm.NUM_AXES)), STOPPED),
     },
     MOVING: {
         "stop":       (("move", [0, 0, 50]), STOPPING),
@@ -63,6 +65,7 @@ axis_data: list[dict[str, Optional[Any]]] = [{
     "can_id": None,
     "state": None,
     "angle": None,
+    "motor_angle": None,
     "timestamp": None
 } for _ in range(arm.NUM_AXES)]
 sequence = []  # Lists of lists of saved positions
@@ -101,18 +104,13 @@ def joint_angles_rel(motor_angle: Union[float, list[float]], axis: Optional[int]
     """
     if not isinstance(motor_angle, list):
         motor_angle = [0 if a != axis else motor_angle for a in AXES]
-    joint_angles = [0] * arm.NUM_AXES  # we're lucky in that num_motors = num_joints = NUM_AXES
-    for motor in AXES:
-        # print(f"{motor=}")
-        for joint in AXES:
-            # print(f"{joint=}")
-            motor_joint_ratio = arm.AXES_ANGLE_RATIO[motor][joint]
-            if motor_joint_ratio != 0:
-                # print(f"{joint_angles[joint]=} += {motor_angle[motor]=} / {motor_joint_ratio=}")
-                joint_angles[joint] += motor_angle[motor] / motor_joint_ratio
-                # print(f"{joint_angles[joint]=}")
-    # print(f"translated relative {motor_angle=} to {joint_angles=}")
-    return joint_angles
+    mot_vec = Matrix(motor_angle)
+    # print(f"{mot_vec=}")
+    transform_mat = 1.0 / Matrix(arm.AXES_ANGLE_RATIO).T
+    # print(f"{transform_mat=}")
+    joint_vec = transform_mat * mot_vec
+    # print(f"{joint_vec=}")
+    return list(joint_vec)
 
 
 def joint_angles_abs(motor_angle: Union[float, list[float]], axis: Optional[int] = None):
@@ -121,11 +119,67 @@ def joint_angles_abs(motor_angle: Union[float, list[float]], axis: Optional[int]
     :param motor_angle: angle in degrees or a list of angles in degrees for all motor axes
     :param axis: index of the axis (if one single motor angle is specified)
     """
-    rel_angles = joint_angles_rel(motor_angle, axis=axis)
-    abs_angles = [a + offset for a, offset in zip(rel_angles, arm.JOINT_ZERO_OFFSET)]
-    # print(f"translated absolute {motor_angle=} to {abs_angles=}")
-    return abs_angles
+    if not isinstance(motor_angle, list):
+        motor_angle = [0 if a != axis else motor_angle for a in AXES]
+    mot_vec = Matrix(motor_angle + [1])  # fill with 1 to make it a 1x7 vector
+    # print(f"{mot_vec=}")
+    transform_mat = 1.0 / Matrix(arm.AXES_ANGLE_RATIO).T
+    transform_mat = transform_mat.extend_bottom(Matrix([0, 0, 0, 0, 0, 0]).T)
+    transform_mat = transform_mat.extend_right(Matrix(arm.JOINT_ZERO_OFFSET + [1]))
+    # print(f"{transform_mat=}")
+    joint_vec = transform_mat * mot_vec
+    # print(f"{joint_vec=}")
+    return list(joint_vec)[:6]
 
+def motor_angles_rel(joint_angle: Union[float, list[float]], axis: Optional[int] = None):
+    """Convert joint angle change in degrees to motor angle changes in degrees.
+    Provide either a list of joint angles for all axes, or an axis index and the angle change for that axis.
+    :param joint_angle: angle change in degrees or a list of angle changes in degrees for all joint axes
+    :param axis: index of the axis (if one single joint angle is specified)
+    """
+    if not isinstance(joint_angle, list):
+        joint_angle = [0 if a != axis else joint_angle for a in AXES]
+    joint_vec = Matrix(joint_angle)
+    # print(f"{joint_vec=}")
+    transform_mat = 1.0 / Matrix(arm.AXES_ANGLE_RATIO).T
+    inv_transform_mat = transform_mat.inverse()
+    # print(f"{transform_mat=}")
+    mot_vec = inv_transform_mat * joint_vec
+    # print(f"{mot_vec=}")
+    return list(mot_vec)
+
+def motor_angles_abs(joint_angle: Union[float, list[float]], axis: Optional[int] = None):
+    """Convert absolute joint angle in degrees to absolute motor angle in degrees.
+    Provide either a list of joint angles for all axes, or an axis index and the angle for that axis.
+    :param joint_angle: angle in degrees or a list of angles in degrees for all joint axes
+    :param axis: index of the axis (if one single joint angle is specified)
+    """
+    if not isinstance(joint_angle, list):
+        joint_angle = [0 if a != axis else joint_angle for a in AXES]
+    joint_vec = Matrix(joint_angle + [1])  # fill with 1 to make it a 1x7 vector
+    # print(f"{joint_vec=}")
+    transform_mat = 1.0 / Matrix(arm.AXES_ANGLE_RATIO).T
+    transform_mat = transform_mat.extend_bottom(Matrix([0, 0, 0, 0, 0, 0]).T)
+    transform_mat = transform_mat.extend_right(Matrix(arm.JOINT_ZERO_OFFSET + [1]))
+    inv_transform_mat = transform_mat.inverse()
+    # print(f"{transform_mat=}")
+    mot_vec = inv_transform_mat * joint_vec
+    # print(f"{mot_vec=}")
+    return list(mot_vec)[:6]
+
+
+# def test_angle_conversions():
+#     """Test the angle conversion functions"""
+#     print(f"{joint_angles_rel([1,2,3,4,5,6])=}")
+#     print(f"{joint_angles_rel2([1,2,3,4,5,6])=}")
+#     print(f"{joint_angles_abs([1,2,3,4,5,6])=}")
+#     print(f"{joint_angles_abs2([1,2,3,4,5,6])=}")
+#     j_a_rel = joint_angles_rel2([1, 2, 3, 4, 5, 6])
+#     print(f"{motor_angles_rel2(j_a_rel)=}")
+#     j_a_abs = joint_angles_abs2([1, 2, 3, 4, 5, 6])
+#     print(f"{motor_angles_abs2(j_a_abs)=}")
+
+# test_angle_conversions();exit(0)
 
 def send_axes(axes_or_messages, cmd=None, values=None, answer_pattern=None):
     for axis_msg in axes_or_messages:
@@ -195,6 +249,12 @@ def on_release(key):
         sequence.clear()
     if key == keyboard.Key.enter:
         next_command[active_axis] = "input"
+    if key == keyboard.KeyCode.from_char('0'):
+        next_command[active_axis] = "move_all_to_zero"
+    if key == keyboard.KeyCode.from_char('0'):
+        next_command[active_axis] = "move_all_to_zero"
+    if hasattr(key, 'char') and key.char in [str(i) for i in range(1, arm.NUM_AXES + 1)]:
+        active_axis = int(key.char) - 1
     termios.tcflush(sys.stdin, termios.TCIOFLUSH)
 
 
@@ -230,14 +290,19 @@ def input_angle(axis):
     keyboard_listener.stop()
     time.sleep(1)
     try:
-        new_angle = float(input(f"Enter MOTOR angle for axis {active_axis}: "))  # todo accept joint angles
-    except ValueError:
-        print("Invalid angle")
+        # new_angle = float(input(f"Enter MOTOR angle for axis {active_axis}: "))  # todo accept joint angles
+        new_angle = float(input(f"Enter joint angle for axis {active_axis}: "))
+        joint_angles = [axis_data[axis]["angle"] for axis in AXES]
+        joint_angles[axis] = new_angle
+        motor_angles = motor_angles_abs(joint_angles)
+    except ValueError as e:
+        print(f"Invalid angle: {e}")
         time.sleep(1)
         start_keyboard_listener()
         return
-    bus.ask(axis2canid(active_axis), "move_to", [600, 50, motor_angle_to_encoder(new_angle)], answer_pattern=[[0], [2], [3]],
-            timeout=arm.AXES_MOVE_TIMEOUT[active_axis])
+    move_to_position(motor_angles)
+    # bus.ask(axis2canid(active_axis), "move_to", [600, 50, motor_angle_to_encoder(new_motor_angle)], answer_pattern=[[0], [2], [3]],
+    #         timeout=arm.AXES_MOVE_TIMEOUT[active_axis])
     start_keyboard_listener()
 
 
@@ -528,6 +593,7 @@ def update_state_from_devices():
 
     joint_angles = joint_angles_abs(motor_angles)
     for axis in AXES:
+        axis_data[axis].update(motor_angle=motor_angles[axis], timestamp=timestamp())
         axis_data[axis].update(angle=joint_angles[axis], timestamp=timestamp())
 
 
@@ -606,15 +672,28 @@ def sensorless_home(axis):
         raise HomingError(f"Error on sensorless homing of axis {axis}: {e}")
 
 
-def home_all():
+def home_all(zero_pose=True):
+    """
+    Home all axes according to configuration in arm.py.
+    :param zero_pose: Move to zero pose after homing
+    :type zero_pose: bool
+    """
+    global state
     for axis in arm.HOMING_ORDER:
         home(axis)
     print(f"All axes homed")
-    # for axis in AXES:
-    #     bus.send(axis2canid(axis), "move_to", [500, 50, motor_angle_to_encoder(AXES_SAFE_HOMING_ANGLE[axis])])
-    global state
-    if any([state[axis] == HOMING for axis in AXES]):
-        state = [STOPPED] * len(AXES)
+    if zero_pose:
+        zero_motor_angles = motor_angles_abs([0] * arm.NUM_AXES)
+        for axis in arm.HOMING_ORDER:
+            zero_angle = zero_motor_angles[axis]
+            bus.send(axis2canid(axis), "move_to", [500, 50, motor_angle_to_encoder(zero_angle)])
+            state[axis] = MOVING
+        for axis in arm.HOMING_ORDER:
+            bus.wait_for(axis2canid(axis), "move_to", value_pattern=[2], timeout=arm.AXES_MOVE_TIMEOUT[axis])
+            state[axis] = STOPPED
+    for axis, curr_state in enumerate(state):
+        if state[axis] == HOMING:
+            state[axis] = STOPPED
 
 
 def execute_transitions():
@@ -660,7 +739,8 @@ if __name__ == "__main__":
                     print_devices()
                     print("\n\n")
                     print(f"Press up/down arrow keys to choose axis, left/right arrow keys to move, esc to quit.")
-                    print(f"'0' to set zero, 'l' to release lock, 'L' to release all locks, 'h' to home axis, 'H' to home all axes.")
+                    print(f"'l' to release lock, 'L' to release all locks, 'h' to home axis, 'H' to home all axes.")
+                    print(f"'0' to move to zero pose")
                     print(f"'s' to save position in sequence, 'p' to play/pause sequence, 'c' to clear sequence.")
                     print_axes()
                     print("\n\n")
