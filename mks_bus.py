@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from contextvars import ContextVar
 from copy import deepcopy
 from queue import Empty, SimpleQueue
 
@@ -30,6 +31,8 @@ import can
 from can import exceptions as can_exceptions  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+current_bus = ContextVar('current_bus')
 
 # CAN Message Structure
 #
@@ -62,7 +65,6 @@ COMMANDS = {  # From "MKS SERVO42&57D_CAN User Manual V1.0.3.pdf"
         "tx_struct": "",  # nothing to send
         "rx_struct": "intbe16",  # RPM (counterclockwise is positive, clockwise is negative)
     },
-    # From GPT4:
     "pulses": {  # Read the number of pulses received
         "cmd": 0x33,
         "tx_struct": "",  # nothing to send
@@ -125,13 +127,16 @@ COMMANDS = {  # From "MKS SERVO42&57D_CAN User Manual V1.0.3.pdf"
         # At 16/32/64 subdivisions, the speed is 1200 (RPM)
         # At 128 subdivisions, the speed is 150 (RPM)
     },
-    # Skipped over 0x85
+    "set_enable": {  # Set the active of the En pin. Same as the "En" option on screen.
+        "cmd": 0x85,
+        "tx_struct": "uintbe8",  # 0: active low (L), 1: active high (H), 2: active always (Hold)
+        "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
+    },
     "set_direction": {  # Set the direction. Same as the "Dir" option on screen.
         "cmd": 0x86,
         "tx_struct": "pad7,bool",  # 0: clockwise, 1: counterclockwise
         "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
     },
-    # Skipped over 0x87
     "set_shaft_lock": {  # Set the motor shaft locked-rotor protection function (Protect)
         "cmd": 0x88,
         "tx_struct": "pad7,bool",  # 1: enable, 0: disable
@@ -147,6 +152,11 @@ COMMANDS = {  # From "MKS SERVO42&57D_CAN User Manual V1.0.3.pdf"
         "tx_struct": "uintbe8",  # 0: 125Kbps, 1: 250Kbps, 2: 500Kbps, 3: 1Mbps
         "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
     },
+    "set_can_id": {  # Set the CAN ID (Same as the "CanID" option on screen)
+        "cmd": 0x8B,
+        "tx_struct": "uintbe16",  # ID (00~7FF where 0 is the broadcast address)
+        "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
+    },
     "set_response": {  # Enable or disable the CAN answer (CanRSP / Uplink frame)
         # Note: when disabled, query the motor state with 0xF1
         "cmd": 0x8C,
@@ -154,11 +164,17 @@ COMMANDS = {  # From "MKS SERVO42&57D_CAN User Manual V1.0.3.pdf"
         "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
     },
     "set_key_lock": {  # Lock or unlock the key
-        "cmd": 0x8C,
+        "cmd": 0x8F,
         "tx_struct": "pad7,bool",  # 1: lock, 0: unlock
         "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
     },
-    # Skipping a few commands
+    "set_group_id": {  # Set the group ID
+        # Send a message with the group ID as the arbitration ID, and all motors with the same group ID will respond.
+        # They won't send a response message.
+        "cmd": 0x8D,
+        "tx_struct": "uintbe16",  # ID (00~7FF where 0 is the broadcast address)
+        "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
+    },
     "set_home_params": {  # Set the homing parameters
         "cmd": 0x90,
         "tx_struct": "pad7,bool, pad7,bool, uintbe16, pad7,bool",  # homeTrig 0: falling edge, 1: rising edge; homeDir: 0: CW, 1: CCW; homeSpeed: 0~3000 RPM; EndLimit: 0: disable, 1: enable
@@ -172,6 +188,12 @@ COMMANDS = {  # From "MKS SERVO42&57D_CAN User Manual V1.0.3.pdf"
     "set_zero": {  # Zero the joint
         "cmd": 0x92,
         "tx_struct": "",  # nothing to send
+        "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
+    },
+    "zero_mode": {  # In 0_Mode, the motor can automatically return to the 0 point position when power on. The maximum angle is 359 degrees.
+        # （Same as “0_Mode、Set 0、0_Speed、0_Dir” options on screen
+        "cmd": 0x9A,
+        "tx_struct": "uintbe8, pad7,bool, uintbe8, pad7,bool",  # mode (0: disable, 1: go 0 with direction, 2: go 0 using nearest direction), enable (0: clear 0, 1: set 0), speed (0-4), direction (0: CW, 1: CCW)
         "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
     },
     # Skipping a few
@@ -576,9 +598,11 @@ class Bus:
         self.reader.stop()
 
     def __enter__(self):
+        self._curr_bus_token = current_bus.set(self)
         return self
 
     def __exit__(self, exception_type, value, traceback):
+        current_bus.reset(self._curr_bus_token)
         self.close()
 
     def send(self, can_id_or_msg: Union[Message, can.Message, int], cmd: Optional[Union[str, int]] = None,
@@ -767,3 +791,13 @@ class Bus:
                 print(f"Found '{substr}' device: {readable_name}")
                 return com_device.device
         return None
+
+
+def encoder_to_motor_angle(encoder_value: int):
+    """Convert encoder value to angle in degrees."""
+    return encoder_value / 0x4000 * 360
+
+
+def motor_angle_to_encoder(angle):
+    """Convert angle in degrees to encoder value."""
+    return int(angle / 360 * 0x4000)
