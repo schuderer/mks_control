@@ -239,8 +239,33 @@ def move_to_motor_position(motor_angles: Union[list[float], float], axis: Option
         plot_move_speeds_and_positions(abs_distances, new_accelerations, new_speeds, ramp_times, vmax_times,
                                        slowest_ramp_time, slowest_vmax_time)
 
+    # Provide the trajectory planning for each axis
+    # Format:
+    # planned_trajectory = [
+    #    (t1, [p1_ax0, p1_ax1, ...], [s1_ax0, s1_ax1, ...]),  # waypoint 1 at time t1: positions and speeds for all 6 axes
+    #    (t2, [p1_ax0, p1_ax1, ...], [s1_ax0, s1_ax1, ...]),  # waypoint 2 at time t2
+    #    ...
+    # ]
+    tick_len: float = 0.1 / 60.0  # in minutes (due to RPM units)
+    planned_trajectory: list[tuple[float, list[float], list[float]]] = []  # tuples of times, positions and speeds for each axis
+    t: float = 0.0
+    while t <= slowest_total_time + tick_len:  # + tick_len to be sure to include the last point
+        waypoint: tuple[float, list[float], list[float]] = (t, [], [])
+        for axis in AXES:
+            # Position in motor degrees (calculations were in turns)
+            position: float = start_pos[axis] + 360 * position_at_time(
+                t, new_accelerations[axis], new_speeds[axis], rel_distances[axis], slowest_ramp_time, slowest_vmax_time)
+            # Speed in RPM
+            speed: float = speed_at_time(t, new_accelerations[axis], new_speeds[axis],
+                                  rel_distances[axis], slowest_ramp_time, slowest_vmax_time)
+            waypoint[1].append(position)
+            waypoint[2].append(speed)
+        planned_trajectory.append(waypoint)
+        t += tick_len
+    print(f"{slowest_total_time=}")
+    print(f"{planned_trajectory=}")
+
     # Run loop to move all axes to the target position
-    tick_len = 0.1 / 60.0  # in minutes (due to RPM units)
     last_tick = time.time()
     dt = tick_len  # in minutes (due to RPM units)
     elapsed_time = 0  # in minutes (due to RPM units)
@@ -248,45 +273,47 @@ def move_to_motor_position(motor_angles: Union[list[float], float], axis: Option
     # pid = [PIDController(kP=0.8, kI=0.01, kD=0.1, max_I=arm.AXES_SPEED_LIMIT[axis]/2, max_error=arm.AXES_SPEED_LIMIT[axis]/2) for axis in AXES]
     # pid = [PIDController(kP=0.25, kI=0.05, kD=0.025, max_I=arm.AXES_SPEED_LIMIT[axis], max_error=arm.AXES_SPEED_LIMIT[axis]) for axis in AXES]
     pid = [PIDController(kP=0.6, kI=0.005, kD=0.075, max_I=arm.AXES_SPEED_LIMIT[axis]/2, max_error=arm.AXES_SPEED_LIMIT[axis]/2) for axis in AXES]
+    # pid = [PIDController(kP=0.6, kI=0.08, kD=0.25, max_I=arm.AXES_SPEED_LIMIT[axis]/2, max_error=arm.AXES_SPEED_LIMIT[axis]/2) for axis in AXES]
     planned_speed_mixin = 0.5  # default: average = 0.5 as in https://source-robotics.github.io/PAROL-docs/page4/#list-of-active-commands
     speed_threshold = 1.5  # RPM
     speed_low_pass_factor = 0.5
     commanded_speeds = [2.0 * speed_threshold] * arm.NUM_AXES  # give some extra settling time
     while (elapsed_time <= slowest_total_time or any(abs(s) > speed_threshold for s in commanded_speeds)) and elapsed_time <= 2* slowest_total_time:
+        planned_positions, planned_speeds = get_positions_and_speeds(planned_trajectory, elapsed_time)
         for axis in AXES:
-            # Calculate the planned position (in motor degrees. Note the slight lookahead, calculations were in turns)
-            planned_position = 360 * position_at_time(elapsed_time, new_accelerations[axis], new_speeds[axis],
-                                                     rel_distances[axis], slowest_ramp_time, slowest_vmax_time)
-            planned_position += start_pos[axis]
+            planned_speed = planned_speeds[axis]
+            planned_position = planned_positions[axis]
+            # Calculate the planned position (in motor degrees, calculations were in turns)
+            # planned_position = 360 * position_at_time(elapsed_time, new_accelerations[axis], new_speeds[axis],
+            #                                           rel_distances[axis], slowest_ramp_time, slowest_vmax_time)
+            # planned_position += start_pos[axis]
+            # planned_speed = speed_at_time(elapsed_time, new_accelerations[axis], new_speeds[axis],
+            #                               rel_distances[axis], slowest_ramp_time, slowest_vmax_time)
+            # if planned_position > 0:
+            #     print(f"live_pos={planned_position}, discr_pos={planned_positions[axis]}, live_speed={planned_speed}, discr_speed={planned_speeds[axis]}")
             # print(f"Axis {axis} calc'd end pos: {360*rel_distances[axis]=} + {start_pos[axis]=} = {360*rel_distances[axis] + start_pos[axis]}")
             # print(f"Axis {axis} {start_pos[axis]=}, {end_pos[axis]=}, {planned_position=}")
 
             # Get the current position
-            if bus is None:
-                # Test mode: set current position to target position
-                curr_pos = planned_position
-            else:
-                (encoder_value,) = bus.ask(axis2canid(axis), "encoder")
-                curr_pos = encoder_to_motor_angle(encoder_value)
+            (encoder_value,) = bus.ask(axis2canid(axis), "encoder")
+            curr_pos = encoder_to_motor_angle(encoder_value)
 
             # Calculate the PID error
-            pid_error = pid[axis](planned_position, curr_pos, dt * 60)
+            pid_error = pid[axis](planned_position, curr_pos, dt * 60)  # *60 is just arbitrary scaling to have sensible PID values
             # print(f"{elapsed_time=}, {axis=}: {curr_pos=}, {planned_position=}, {dt=}, {planned_position-curr_pos=}, {pid_error=}")
 
-            target_velocity = speed_at_time(elapsed_time, new_accelerations[axis], new_speeds[axis],
-                                            rel_distances[axis], slowest_ramp_time, slowest_vmax_time)
-            adjusted_velocity = planned_speed_mixin * target_velocity + (1 - planned_speed_mixin) * pid_error
-            adjusted_velocity = constrain(adjusted_velocity, -arm.AXES_SPEED_LIMIT[axis], arm.AXES_SPEED_LIMIT[axis])
-            if abs(adjusted_velocity) < speed_threshold:
-                adjusted_velocity = 0
-            direction = 1 if adjusted_velocity > 0 else 0
+            adjusted_speed = planned_speed_mixin * planned_speed + (1 - planned_speed_mixin) * pid_error
+            adjusted_speed = constrain(adjusted_speed, -arm.AXES_SPEED_LIMIT[axis], arm.AXES_SPEED_LIMIT[axis])
+            if abs(adjusted_speed) < speed_threshold:
+                adjusted_speed = 0
+            direction = 1 if adjusted_speed > 0 else 0
             direction = 1 - direction if arm.AXES_RAW_DIRECTION[axis] else direction
             accel = arm.AXES_ACCEL_LIMIT[axis]
             # print(f"Axis {axis}: {direction=}, {adjusted_velocity=}, {accel=}")
             if bus is not None:
-                bus.ask(axis2canid(axis), "move", [direction, abs(adjusted_velocity), accel], answer_pattern=[None])
+                bus.ask(axis2canid(axis), "move", [direction, abs(adjusted_speed), accel], answer_pattern=[None])
 
-            commanded_speeds[axis] += speed_low_pass_factor * (adjusted_velocity - commanded_speeds[axis])
+            commanded_speeds[axis] += speed_low_pass_factor * (adjusted_speed - commanded_speeds[axis])
             if abs(commanded_speeds[axis]) < speed_threshold:
                 commanded_speeds[axis] = 0
 
@@ -297,8 +324,6 @@ def move_to_motor_position(motor_angles: Union[list[float], float], axis: Option
             time.sleep(0.01)
         elapsed_time += dt
         last_tick = time.time()
-
-    print(f"{commanded_speeds=}")
 
     if bus is not None:
         stop_all(bus=bus)
@@ -312,6 +337,38 @@ def move_to_motor_position(motor_angles: Union[list[float], float], axis: Option
             for axis in AXES:
                 bus.wait_for(axis2canid(axis), "move_to", value_pattern=[[0], [2], [3]], timeout=max(arm.AXES_MOVE_TIMEOUT))
 
+
+def get_positions_and_speeds(trajectory: list[tuple[float, list[float], list[float]]], t: float, t0: float = 0.0) -> tuple[list[float], list[float]]:
+    """Get the positions and speeds of all axes at a given time from a trajectory.
+    Interpolates between the given time points.
+    :param trajectory: the trajectory list of tuples of times, positions, and speeds for each axis
+    :param t: the time to get the positions and speeds for
+    :param t0: the start time offset of the trajectory (default: 0.0 = no offset)
+    :return: a tuple of lists of axis positions and speeds
+    """
+    if not trajectory:
+        raise ValueError("Trajectory is empty.")
+    if t <= 0:
+        return trajectory[0][1], trajectory[0][2]
+    if t >= trajectory[-1][0]:
+        return trajectory[-1][1], trajectory[-1][2]
+    for i in range(len(trajectory) - 1):
+        if trajectory[i][0] <= t < trajectory[i + 1][0]:
+            # Trajectory waypoints are lists of axis values, each a tuple of time, position and speed
+            t1 = trajectory[i][0]
+            t2 = trajectory[i + 1][0]
+            positions: list[float] = []
+            speeds: list[float] = []
+            for p1, s1, p2, s2 in zip(*trajectory[i][1:], *trajectory[i + 1][1:]):
+                # For all axes, interpolate between the two waypoints
+                if t1 == t2:
+                    positions.append(p1)
+                    speeds.append(s1)
+                elif t1 <= t < t2:
+                    positions.append(p1 + (p2 - p1) * (t - t1) / (t2 - t1))
+                    speeds.append(s1 + (s2 - s1) * (t - t1) / (t2 - t1))
+            return positions, speeds
+    return trajectory[-1][1], trajectory[-1][2]  # In case something goes wrong with the time comparison
 
 def mks_accel_to_rpm_accel(mks_accel_value: int, fix_bounds=False) -> float:
     """Convert the MKS board's acceleration value to physical acceleration
@@ -657,7 +714,7 @@ if __name__ == "__main__":
     send_axes(cmd="set_zero", bus=bus, answer_pattern=[None])
     # send_axes(cmd="zero_mode", values=[2, 1, 0, 0], bus=bus, answer_pattern=[1])
     print(get_curr_motor_positions(bus))
-    axis = 3
+    axis = 0
     force_end_pos = True
     pos = [None, None, None, None, None, None]
     pos[axis] = 3000
@@ -665,17 +722,12 @@ if __name__ == "__main__":
     time.sleep(1)
     # print("correcting...")
     # move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
-    time.sleep(2)
+    # time.sleep(2)
     pos = [None, None, None, None, None, None]
-    pos[axis] = -2000
+    pos[axis] = 0
     move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
     time.sleep(1)
-    # print("correcting...")
-    # move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
-    time.sleep(2)
-    send_axes([axis], cmd="move_to", values=[500, 100, 0], bus=bus, answer_pattern=[[0], [2], [3]])
-    time.sleep(2)
-    send_axes([axis], cmd="move_to", values=[500, 100, 0], bus=bus, answer_pattern=[[0], [2], [3]])
+    bus.close()
 
     never = False
     if never:
