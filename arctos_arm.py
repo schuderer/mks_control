@@ -74,7 +74,7 @@ AXES_HOMING_DIRECTION = [ENDSTOP, CW, CCW, ENDSTOP, CW, CW]
 AXES_HOMING_CURRENT_LIMIT = [450, 450, 450, 450, 450, 500]  # in mA
 AXES_SAFE_HOMING_ANGLE = [AXES_ANGLE_RANGE[i] * factor for i, factor in enumerate([0, 0.25, 0.75, 0.5, 0.5, 0.5])]
 # order in which to home the axes (homing 3 twice to prevent collisions at first and to make it look neat in the end)
-HOMING_ORDER = [5, 4, 3, 2, 1, 0, 4]
+HOMING_ORDER = [5, 4, 3, 2, 1, 0, 3]
 
 # Others
 ARM_DEMO_SEQUENCE = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
