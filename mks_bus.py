@@ -650,8 +650,12 @@ class Bus:
         See `send` and `wait_for` for more details.
         """
         sent_msg = self.send(can_id_or_msg, cmd, *values)
-        # print(f"ask: {cmd=}, {sent_msg=}")
-        return self.wait_for(sent_msg, value_pattern=answer_pattern, timeout=timeout)
+        start_time = time.time()
+        # print(f"Bus at 0s: Before ask with {sent_msg=}")
+        response = self.wait_for(sent_msg, value_pattern=answer_pattern, timeout=timeout)
+        # print(f"Bus at {time.time() - start_time}s: After ask with {response=}")
+        # print(f"{self._msg_buffer=}")
+        return response
 
     def receive(self, timeout=RECV_TIMEOUT):
         """Receive a message from the CAN bus.
@@ -712,7 +716,7 @@ class Bus:
         :param value_pattern: Optional: A list or tuple of values to match in the message data.
                                         If not None, the message data must match all values in the tuple (logical AND).
                                         None-entries in the pattern are ignored.
-                                        If a list of value patterns is provided, the any match of the value patterns counts as success (logical OR).
+                                        If a list of value patterns is provided, any match of the value patterns counts as success (logical OR).
         :param timeout: The maximum time to wait for a matching message.
         :return: The first matching message that was received.
 
@@ -750,7 +754,7 @@ class Bus:
                     values = msg.values
                     if value_pattern is None:
                         # None matches anything
-                        self._msg_buffer.extend(msgs[msg_idx+1:])  # Regression: don't throw out remaining messages
+                        self._msg_buffer.extend(msgs[msg_idx + 1:])  # Regression: don't throw out remaining messages
                         return msg
                     else:
                         if len(value_pattern) > 0 and not isinstance(value_pattern[0], (list, tuple)):
