@@ -1,12 +1,26 @@
 import time
 from contextvars import ContextVar
+from datetime import datetime
 from functools import cache
 from math import sqrt
-from typing import Union, Optional
+import multiprocessing
+from multiprocessing import Process
+from multiprocessing.connection import Connection
+from queue import SimpleQueue
+from typing import Union, Optional, Any
 
 import arctos_arm as arm
 from matrix import Matrix
-from mks_bus import encoder_to_motor_angle, motor_angle_to_encoder, current_bus
+from mks_bus import Bus, WAIT_FOR_TIMEOUT, encoder_to_motor_angle, motor_angle_to_encoder, current_bus
+
+current_bus_proxy = ContextVar('current_bus_proxy')
+
+
+# Constants
+ERROR = "error"
+STOPPING = "stopping"
+STOPPED = "stopped"
+MOVING = "moving"
 
 AXES = list(range(arm.NUM_AXES))
 MOTOR_TO_JOINT_TRANSFORM_MAT_REL = 1.0 / Matrix(arm.AXES_ANGLE_RATIO).T
@@ -14,6 +28,16 @@ MOTOR_TO_JOINT_TRANSFORM_MAT_ABS = MOTOR_TO_JOINT_TRANSFORM_MAT_REL.extend_botto
 MOTOR_TO_JOINT_TRANSFORM_MAT_ABS = MOTOR_TO_JOINT_TRANSFORM_MAT_ABS.extend_right(Matrix(arm.JOINT_ZERO_OFFSET + [1]))
 JOINT_TO_MOTOR_TRANSFORM_MAT_REL = MOTOR_TO_JOINT_TRANSFORM_MAT_REL.inverse()
 JOINT_TO_MOTOR_TRANSFORM_MAT_ABS = MOTOR_TO_JOINT_TRANSFORM_MAT_ABS.inverse()
+
+control_process: Optional[multiprocessing.Process] = None
+motion_conn: Optional[Connection] = None
+
+BUS_ARGS = {k:v for k, v in {
+    "bustype_or_bus": getattr(arm, "CAN_BUS_TYPE", None),
+    "device": getattr(arm, "CAN_DEVICE", None),
+    "bitrate": getattr(arm, "CAN_BITRATE", None),
+    "device_searchstr": getattr(arm, "CAN_AUTODETECT_STRING", None),
+}.items() if v is not None}
 
 def axis2canid(axis):
     """Convert axis index to can id. Axes are zero-based, while device CAN IDs start at 1."""
@@ -77,16 +101,148 @@ def motor_angles_abs(joint_angle: Union[float, list[float]], axis: Optional[int]
     return list(mot_vec)[:6]
 
 
+class BusProxy:
+    """A proxy class for the bus object to send messages to the controller subprocess which owns the CAN connection."""
+    def __init__(self, bus_args=None) -> None:
+        if hasattr(self, 'connection') and getattr(self, "connection") is not None:
+            raise RuntimeError(f"There is already an active bus connection for this BusProxy.")
+        self.connection: Connection = start_control(bus_args=bus_args)
+        self._buffer = []
+        self._id_seq = 0
+
+    def _new_id(self):
+        self._id_seq += 1
+        return self._id_seq
+
+    def _slurp_messages(self, timeout=0):
+        if self.connection.poll(timeout):
+            while self.connection.poll(0):
+                self._buffer.append(self.connection.recv())
+        # else:
+        #     print(3)
+        #     import traceback
+        #     traceback.print_stack()
+        #     print(4)
+        #     raise TimeoutError(f"BusProxy: Timeout while waiting for CAN responses.")
+
+    def _get_message(self, msg_id):
+        for i, msg in enumerate(self._buffer):
+            if msg.get("id") == msg_id:
+                return self._buffer.pop(i)["result"]
+        raise RuntimeError(f"BusProxy did not receive response with id {msg_id}. Messages: {self._buffer}")
+
+    def _wait_for(self, msg_id, timeout):
+        self._slurp_messages(timeout)
+        return self._get_message(msg_id)
+
+    # Low-level CAN commands
+    def send(self, can_id: int, cmd: Optional[Union[str, int]] = None, *values: Union[list[Union[int, bool]], int, bool]):
+        # print(f"BusProxy send: {can_id=}, {cmd=}, {values=}")
+        my_id = self._new_id()
+        message = {"id": my_id, "protocol": "can_bus", "data": ("send", (can_id, cmd, *values), {})}
+        # print(f"BusProxy send:\n{message=}\n-->\n{None}")
+        self.connection.send(message)
+
+    def wait_for(self, can_id: int, cmd: Optional[Union[str, int]] = None, value_pattern: Optional[list] = None, timeout=WAIT_FOR_TIMEOUT):
+        # print(f"BusProxy wait_for: {can_id=}, {cmd=}, {value_pattern=}")
+        my_id = self._new_id()
+        message = {"id": my_id, "protocol": "can_bus", "data": ("wait_for", (can_id, cmd, value_pattern), {"timeout": timeout})}
+        # print(f"BusProxy wait_for:\n{message=}")
+        self.connection.send(message)
+        answer = self._wait_for(my_id, timeout)
+        # print(f"BusProxy wait_for answer:\n{answer=}")
+        return answer
+
+    def ask(self, can_id: int, cmd: Optional[Union[str, int]] = None,
+            *values: Union[list[Union[int, bool]], int, bool], answer_pattern: Optional[list] = None, timeout=WAIT_FOR_TIMEOUT):
+        # print(f"BusProxy ask: {can_id=}, {cmd=}, {values=}, {answer_pattern=}")
+        my_id = self._new_id()
+        message = {"id": my_id, "protocol": "can_bus", "data": ("ask", (can_id, cmd, *values), {"answer_pattern": answer_pattern, "timeout": timeout})}
+        # print(f"BusProxy ask: {message=}")
+        # print(f"BusProxy {self._buffer=}")
+        self.connection.send(message)
+        answer = self._wait_for(my_id, timeout)
+        # print(f"BusProxy ask answer:\n{answer=}")
+        return answer
+
+    def flush(self, ):
+        """Flush the receive buffer, discarding all messages."""
+        my_id = self._new_id()
+        message = {"id": my_id, "protocol": "can_bus", "data": ("flush", (), {})}
+        self.connection.send(message)
+
+    # Higher-level commands
+    def get_state(self):
+        message = {"protocol": "system", "data": "state"}
+        self.connection.send(message)
+        return self.connection.recv()
+        # if self.connection.poll(timeout):
+        #     return self.connection.recv()
+        # return None
+
+    def submit_trajectory(self, trajectory):
+        message = {"protocol": "trajectory", "data": trajectory}
+        self.connection.send(message)
+
+    def clear_trajectory_queue(self):
+        message = {"protocol": "system", "data": "clear_trajectory_queue"}
+        self.connection.send(message)
+
+    def stop(self):
+        message = {"protocol": "system", "data": "stop"}
+        self.connection.send(message)
+
+    def close(self):
+        if self.connection is not None:
+            stop_control()  # todo pull function in here?
+            # message = {"protocol": "can_bus", "data": ("close", (), {})}
+            # self.connection.send(message)
+            # time.sleep(0.2)  # wait for the message to be sent
+
+    # Context manager housekeeping
+    def __enter__(self):
+        self._curr_bus_token = current_bus_proxy.set(self)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        current_bus_proxy.reset(self._curr_bus_token)
+        self.close()
+        return False
+
+
+class MockBus:
+    """A drop-in mock replacementfor the bus object to send messages to the controller subprocess which owns the CAN connection."""
+    def __init__(self, *args, **kwargs) -> None:
+        print(f"MockBus with args={args}, kwargs={kwargs}")
+
+    def send(self, can_id: int, cmd: Optional[Union[str, int]] = None, *values: Union[list[Union[int, bool]], int, bool]):
+        print(f"MockBus send: {can_id=}, {cmd=}, {values=}")
+
+    def wait_for(self, can_id: int, cmd: Optional[Union[str, int]] = None, value_pattern: Optional[list] = None, timeout=WAIT_FOR_TIMEOUT):
+        print(f"MockBus wait_for: {can_id=}, {cmd=}, {value_pattern=}")
+        return (42,)
+
+    def ask(self, can_id: int, cmd: Optional[Union[str, int]] = None,
+            *values: Union[list[Union[int, bool]], int, bool], answer_pattern: Optional[list] = None, timeout=WAIT_FOR_TIMEOUT):
+        print(f"MockBus ask: {can_id=}, {cmd=}, {values=}, {answer_pattern=}")
+        return (42,)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
 def stop_all(bus=None):
     """Stop all axes of the robot arm.
     :param bus: the bus object to use for communication (default: current_bus)
     """
-    if bus is None:
-        bus = current_bus.get()
+    bus = bus or current_bus_proxy.get()
     for axis in AXES:
         bus.send(axis2canid(axis), "move", [0, 0, 200])
-    for axis in AXES:
-        bus.wait_for(axis2canid(axis), "move", value_pattern=[[0], [2]], timeout=max(arm.AXES_MOVE_TIMEOUT))
+    # for axis in AXES:
+    #     bus.wait_for(axis2canid(axis), "move", value_pattern=[[0], [2]], timeout=max(arm.AXES_MOVE_TIMEOUT))
 
 
 def constrain(value, min_val, max_val):
@@ -161,7 +317,7 @@ class PIDController:
         return pid_error
 
 
-def move_to_joint_position(joint_angles: Union[list[float], float], axis: Optional[int] = None, force_end_pos=True, bus=None):
+def move_to_joint_position(joint_angles: Union[list[float], float], axis: Optional[int] = None, bus=None):
     if not isinstance(joint_angles, list):
         if axis is None:
             raise ValueError("Either provide a list of joint_angles for all axes or specify an single joint angle and an axis index.")
@@ -171,30 +327,32 @@ def move_to_joint_position(joint_angles: Union[list[float], float], axis: Option
     else:
         end_pos: list = joint_angles
     motor_angles = joint_angles_abs(end_pos)
-    move_to_motor_position(motor_angles, force_end_pos=force_end_pos, bus=bus)
+    move_to_motor_position(motor_angles, bus=bus)
 
-def move_to_motor_position(motor_angles: Union[list[float], float], axis: Optional[int] = None, force_end_pos=True, bus=None):
+def move_to_motor_position(motor_angles: Union[list[float], float], axis: Optional[int] = None, start_pos=None, override=False, bus=None) -> list[float]:
     """Move the robot arm to a specific position given in motor angles in degrees.
     The function will calculate the necessary acceleration and speed values to reach the target position in a
     coordinated manner and then send the movement commands to the individual axes.
     :param motor_angles: list of target motor angles in degrees for all axes
     :param axis: index of the axis to move (if only one motor angle is specified)
+    :param start_pos: list of current motor angles in degrees for all axes (default: None = get current positions)
+    :param override: whether to override the current trajectory conn (default: False)
     :param bus: the bus object to use for communication (default: current_bus)
+    :return: the target motor angles in degrees
     """
-    if bus is None:
-        bus = current_bus.get()
-        if bus is None:
-            print("*** move_to_motor_position: No bus object available: running in TEST mode ***")
-    if not isinstance(motor_angles, list):
+    bus = bus or current_bus.get()
+    # print(f"move_to_motor_position got bus: {bus}")
+    if isinstance(motor_angles, list):
+        end_pos: list = motor_angles
+    else:
         if axis is None:
             raise ValueError("Either provide a list of motor angles for all axes or specify an single motor_angle and an axis index.")
         angle = motor_angles
         end_pos: list = [None] * arm.NUM_AXES
         end_pos[axis] = angle
-    else:
-        end_pos: list = motor_angles
 
-    start_pos = [0] * arm.NUM_AXES if bus is None else get_curr_motor_positions(bus)
+    if start_pos is None:
+        start_pos = [0] * arm.NUM_AXES if bus is None else get_curr_motor_positions(bus)  # TODO: reuse busproxy abstraction
 
     # Fill in missing ending positions with the current positions (no movement)
     for i, angle in enumerate(end_pos):
@@ -223,7 +381,6 @@ def move_to_motor_position(motor_angles: Union[list[float], float], axis: Option
 
     # Now that we know the slowest axis, scale all accelerations and speeds so all accelerations, vmax travels, and
     # decelerations start/end at the same time (that is, the one of the slowest axis).
-
     (new_accelerations,
      new_speeds,
      speed_correction) = calc_adapted_accelerations_and_vmax(slowest_ramp_time, slowest_vmax_time, abs_distances)
@@ -265,78 +422,344 @@ def move_to_motor_position(motor_angles: Union[list[float], float], axis: Option
     print(f"{slowest_total_time=}")
     print(f"{planned_trajectory=}")
 
+    # Add the trajectory to the control conn
+    if override:
+        # bus.clear_trajectory_queue()  # TODO: reuse busproxy abstraction
+        motion_conn.send({"protocol": "system", "data": "clear_trajectory_queue"})
+    # bus.submit_trajectory(planned_trajectory)  # TODO: reuse abstraction
+    motion_conn.send({"protocol": "trajectory", "data": planned_trajectory})
+
+    return end_pos
+
+    # control_trajectory(bus)
+
+    # stop_all(bus=bus)
+    #
+    # if force_end_pos:
+    #     # time.sleep(2 * tick_len)  # wait for vibrations to settle
+    #     # Move to target position just to be safe
+    #     for axis in AXES:
+    #         bus.send(axis2canid(axis), "move_to",
+    #                  [arm.AXES_SPEED_LIMIT[axis], arm.AXES_ACCEL_LIMIT[axis], motor_angle_to_encoder(end_pos[axis])])
+    #     for axis in AXES:
+    #         bus.wait_for(axis2canid(axis), "move_to", value_pattern=[[0], [2], [3]], timeout=max(arm.AXES_MOVE_TIMEOUT))
+
+
+def start_control(bus_args=None):
+    """Start the control loop for the robot arm."""
+    if bus_args is None:
+        bus_args = BUS_ARGS
+    global control_process
+    if control_process is not None:
+        raise ValueError("Control loop is already running.")
+    # Create a multiprocessing connection
+    global motion_conn
+    motion_conn, controller_conn = multiprocessing.Pipe(duplex=True)
+    # Start the consumer process
+    control_process = Process(target=control_trajectory, args=(controller_conn, bus_args))
+    control_process.start()
+    return motion_conn
+
+
+def stop_control():
+    """Stop the control loop for the robot arm."""
+    global control_process
+    if control_process is None:
+        raise ValueError("Control loop is not running.")
+    motion_conn.send({"protocol": "system", "data": "quit"})
+    control_process.join()
+    motion_conn.close()
+    control_process = None
+    print("Control loop stopped.")
+
+
+def control_trajectory(controller_conn: Connection, bus_args: dict):
+    print("Motion controller: Initializing")
+    tick_len = 0.05 / 60.0  # in minutes (due to RPM units)
     # Run loop to move all axes to the target position
     last_tick = time.time()
     dt = tick_len  # in minutes (due to RPM units)
+    one_sixtieth = 1.0 / 60.0
     elapsed_time = 0  # in minutes (due to RPM units)
+    last_stop_time = 0  # when the last trajectory has ended (used for sleep timeout)
+    last_info_update = 0
+    last_heartbeat = 0
     # pid = [PIDController(kP=1.0, kI=0.0, kD=0.01, max_I=arm.AXES_SPEED_LIMIT[axis]/2, max_error=arm.AXES_SPEED_LIMIT[axis]/2) for axis in AXES]
     # pid = [PIDController(kP=0.8, kI=0.01, kD=0.1, max_I=arm.AXES_SPEED_LIMIT[axis]/2, max_error=arm.AXES_SPEED_LIMIT[axis]/2) for axis in AXES]
     # pid = [PIDController(kP=0.25, kI=0.05, kD=0.025, max_I=arm.AXES_SPEED_LIMIT[axis], max_error=arm.AXES_SPEED_LIMIT[axis]) for axis in AXES]
-    pid = [PIDController(kP=0.6, kI=0.005, kD=0.075, max_I=arm.AXES_SPEED_LIMIT[axis]/2, max_error=arm.AXES_SPEED_LIMIT[axis]/2) for axis in AXES]
+    pid = [PIDController(kP=0.6, kI=0.005, kD=0.075, max_I=arm.AXES_SPEED_LIMIT[axis] / 2,
+                         max_error=arm.AXES_SPEED_LIMIT[axis] / 2) for axis in AXES]
     # pid = [PIDController(kP=0.6, kI=0.08, kD=0.25, max_I=arm.AXES_SPEED_LIMIT[axis]/2, max_error=arm.AXES_SPEED_LIMIT[axis]/2) for axis in AXES]
     planned_speed_mixin = 0.5  # default: average = 0.5 as in https://source-robotics.github.io/PAROL-docs/page4/#list-of-active-commands
     speed_threshold = 1.5  # RPM
-    speed_low_pass_factor = 0.5
-    commanded_speeds = [2.0 * speed_threshold] * arm.NUM_AXES  # give some extra settling time
-    while (elapsed_time <= slowest_total_time or any(abs(s) > speed_threshold for s in commanded_speeds)) and elapsed_time <= 2* slowest_total_time:
-        planned_positions, planned_speeds = get_positions_and_speeds(planned_trajectory, elapsed_time)
-        for axis in AXES:
-            planned_speed = planned_speeds[axis]
-            planned_position = planned_positions[axis]
-            # Calculate the planned position (in motor degrees, calculations were in turns)
-            # planned_position = 360 * position_at_time(elapsed_time, new_accelerations[axis], new_speeds[axis],
-            #                                           rel_distances[axis], slowest_ramp_time, slowest_vmax_time)
-            # planned_position += start_pos[axis]
-            # planned_speed = speed_at_time(elapsed_time, new_accelerations[axis], new_speeds[axis],
-            #                               rel_distances[axis], slowest_ramp_time, slowest_vmax_time)
-            # if planned_position > 0:
-            #     print(f"live_pos={planned_position}, discr_pos={planned_positions[axis]}, live_speed={planned_speed}, discr_speed={planned_speeds[axis]}")
-            # print(f"Axis {axis} calc'd end pos: {360*rel_distances[axis]=} + {start_pos[axis]=} = {360*rel_distances[axis] + start_pos[axis]}")
-            # print(f"Axis {axis} {start_pos[axis]=}, {end_pos[axis]=}, {planned_position=}")
+    planned_positions: list[Optional[float]] = [None] * arm.NUM_AXES
+    planned_speeds = [0.0] * arm.NUM_AXES
+    current_trajectory = None
+    # Format:
+    # current_trajectory = [
+    #    (t1, [p1_ax0, p1_ax1, ...], [s1_ax0, s1_ax1, ...]),  # waypoint 1 at time t1: positions and speeds for all axes
+    #    (t2, [p1_ax0, p1_ax1, ...], [s1_ax0, s1_ax1, ...]),  # waypoint 2 at time t2
+    #    ...
+    # ]
+    trajectory_queue = SimpleQueue()
+    motor_state: list[dict[str, Optional[Any]]] = [{
+        "can_id": axis2canid(axis),
+        "state": STOPPED,
+        "angle": None,
+        "locked": None,
+        "timestamp": None,
+    } for axis in range(arm.NUM_AXES)]
+    message_waiting = False  # flag to make sure that we only poll controller_conn once per loop
 
-            # Get the current position
-            (encoder_value,) = bus.ask(axis2canid(axis), "encoder")
-            curr_pos = encoder_to_motor_angle(encoder_value)
+    control_loop_active = True
 
-            # Calculate the PID error
-            pid_error = pid[axis](planned_position, curr_pos, dt * 60)  # *60 is just arbitrary scaling to have sensible PID values
-            # print(f"{elapsed_time=}, {axis=}: {curr_pos=}, {planned_position=}, {dt=}, {planned_position-curr_pos=}, {pid_error=}")
+    def update_motor_angles(bus, axis=None):
+        nonlocal motor_state
+        axes_to_handle = [axis] if axis is not None else AXES
+        for axis in axes_to_handle:
+            try:
+                (encoder,) = bus.ask(axis2canid(axis), "encoder", timeout=0.1)
+                angle = encoder_to_motor_angle(encoder)
+                motor_state[axis]["angle"] = angle
+            except TimeoutError as e:
+                print(f"WARNING: Motion controller got no answer from CAN ID {axis2canid(axis)} when asking for encoder: {e}")
+                return
+        if axis is not None:
+            return motor_state[axis]["angle"]
 
-            adjusted_speed = planned_speed_mixin * planned_speed + (1 - planned_speed_mixin) * pid_error
-            adjusted_speed = constrain(adjusted_speed, -arm.AXES_SPEED_LIMIT[axis], arm.AXES_SPEED_LIMIT[axis])
-            if abs(adjusted_speed) < speed_threshold:
-                adjusted_speed = 0
-            direction = 1 if adjusted_speed > 0 else 0
-            direction = 1 - direction if arm.AXES_RAW_DIRECTION[axis] else direction
-            accel = arm.AXES_ACCEL_LIMIT[axis]
-            # print(f"Axis {axis}: {direction=}, {adjusted_velocity=}, {accel=}")
-            if bus is not None:
-                bus.ask(axis2canid(axis), "move", [direction, abs(adjusted_speed), accel], answer_pattern=[None])
+    def update_motor_states(bus, axis=None):
+        nonlocal motor_state
+        axes_to_handle = [axis] if axis is not None else AXES
+        for axis in axes_to_handle:
+            try:
+                (motor_status_code,) = bus.ask(axis2canid(axis), "motor_status", timeout=0.1)
+                # 0: error, 1: stopped, 2: accelerate, 3: decelerate, 4: full speed, 5: homing
+                # print(f"Motor state: {motor_state}")
+                motor_state[axis]["state"] = [ERROR, STOPPED, MOVING, STOPPING, MOVING, MOVING][motor_status_code]
+            except TimeoutError as e:
+                print(f"WARNING: Motion controller got no answer from CAN ID {axis2canid(axis)} when asking for motor_status: {e}")
+                return
+            motor_state[axis]["timestamp"] = datetime.utcnow()
+        if axis is not None:
+            return motor_state[axis]["state"]
 
-            commanded_speeds[axis] += speed_low_pass_factor * (adjusted_speed - commanded_speeds[axis])
-            if abs(commanded_speeds[axis]) < speed_threshold:
-                commanded_speeds[axis] = 0
+    def update_motor_locks(bus, axis=None):
+        nonlocal motor_state
+        axes_to_handle = [axis] if axis is not None else AXES
+        for axis in axes_to_handle:
+            try:
+                (lock_state,) = bus.ask(axis2canid(axis), "shaft_lock_status", timeout=0.1)
+                motor_state[axis]["locked"] = lock_state
+            except TimeoutError as e:
+                print(f"WARNING: Motion controller got no answer from CAN ID {axis2canid(axis)} when asking for shaft_lock_status: {e}")
+                return
+        if axis is not None:
+            return motor_state[axis]["locked"]
 
-        # Wait for the next tick
-        dt = 0
-        while dt < tick_len:
-            dt = (time.time() - last_tick) / 60.0
-            time.sleep(0.01)
-        elapsed_time += dt
-        last_tick = time.time()
+    def update_all_motor_info(bus):
+        update_motor_angles(bus)
+        update_motor_states(bus)
+        update_motor_locks(bus)
 
-    if bus is not None:
-        stop_all(bus=bus)
+    def clear_queue():
+        while not trajectory_queue.empty():
+            trajectory_queue.get_nowait()
+        print("Motion controller: Trajectory queue cleared")
 
-        if force_end_pos:
-            # time.sleep(2 * tick_len)  # wait for vibrations to settle
-            # Move to target position just to be safe
-            for axis in AXES:
-                bus.send(axis2canid(axis), "move_to",
-                         [arm.AXES_SPEED_LIMIT[axis], arm.AXES_ACCEL_LIMIT[axis], motor_angle_to_encoder(end_pos[axis])])
-            for axis in AXES:
-                bus.wait_for(axis2canid(axis), "move_to", value_pattern=[[0], [2], [3]], timeout=max(arm.AXES_MOVE_TIMEOUT))
+    def end_trajectory():
+        nonlocal current_trajectory, planned_positions, planned_speeds, last_stop_time, elapsed_time
+        if current_trajectory is not None:
+            print("Motion controller: Enable idling at end position")
+            planned_positions = current_trajectory[-1][1]
+            planned_speeds = [0.0] * arm.NUM_AXES
+            last_stop_time = elapsed_time
+            current_trajectory = None
+        else:
+            print("Motion controller: No trajectory to end.")
 
+    def check_next_trajectory():
+        nonlocal current_trajectory, elapsed_time, control_loop_active
+        if current_trajectory is None:
+            if not trajectory_queue.empty():
+                current_trajectory = trajectory_queue.get_nowait()
+                elapsed_time = 0
+                control_loop_active = True
+                print(f"Motion controller: Starting new trajectory: {current_trajectory}")
+
+    print("Motion controller: Starting control loop.")
+    # with MockBus(**bus_args) as bus:
+    with Bus(**bus_args) as bus:
+        # TODO: catch and handle fatal errors on this level
+        update_all_motor_info(bus)
+        while True:
+            # TODO: catch and handle non-fatal errors on this level
+            if (elapsed_time - last_heartbeat) * 60 >= 1.0:  # TODO (should be every 10 seconds or so eventually)
+                print(f"Motion controller: Heartbeat {60*dt=}, {elapsed_time=}, {planned_positions=}, {planned_speeds=}, {current_trajectory=}, {motion_conn=}")
+                last_heartbeat = elapsed_time
+
+            if (elapsed_time - last_info_update) * 60 >= 1.1:  # TODO: make sure that main program maintains its own always-up-to-date motor state
+                if not control_loop_active:
+                    update_motor_angles(bus)  # Gets updated by the loop itself, saves one transaction per device
+                update_motor_states(bus)
+                update_motor_locks(bus)
+                last_info_update = elapsed_time
+
+            # Check if the current trajectory has ended
+            if current_trajectory is not None and elapsed_time > current_trajectory[-1][0]:
+                # current trajectory ends
+                print("Motion controller: Trajectory ended")
+                end_trajectory()
+
+            check_next_trajectory()
+
+            # Get the next trajectory if there is none or the previous one has ended
+            # if current_trajectory is None:  # TODO: should this also work if a trajectory is running?
+            if message_waiting or controller_conn.poll():  # got a message via the control connection
+                item = controller_conn.recv()  # Todo: change to movement (including speeds) (how to interpolate then?)
+                protocol: str = item and str(item.get('protocol')).lower()
+                data: Union[list, str] = protocol and item.get('data')
+                if protocol == "system":
+                    if data.lower() == "quit":
+                        print("Motion controller: Received quit signal")
+                        stop_all(bus=bus)
+                        break
+                    if data.lower() == "stop":
+                        print("Motion controller: Received stop signal")
+                        stop_all(bus=bus)
+                        clear_queue()
+                        end_trajectory()
+                        last_stop_time = -1
+                    elif data.lower() == "clear_trajectory_queue":
+                        print("Motion controller: Clearing trajectory queue")
+                        clear_queue()
+                    elif data.lower() == "state":
+                        if not control_loop_active:
+                            mode = "can_mode"
+                        elif current_trajectory is not None:
+                            mode = "trajectory"
+                        else:
+                            mode = "idle"
+                        state = {
+                            "mode": mode,
+                            "motors": motor_state,
+                        }
+                        # print(f"Getting mode {state}")
+                        controller_conn.send(state)
+                elif protocol == "trajectory":
+                    # Add path to trajectory queue
+                    trajectory_queue.put_nowait(data)
+                    print(f"Motion controller: New trajectory queued: {data}")
+                elif protocol == "can_bus":
+                    # Low-level CAN commands
+                    # print(f"Received CAN command: {data}")
+                    control_loop_active = False
+                    msg_id = item["id"]  # TODO: should we also enforce ID matching for trajectories?
+                    method, args, kwargs = data
+                    if method == "send":
+                        # print(f"Sending CAN message: {args=}, {kwargs=} to {bus}")
+                        bus.send(*args, **kwargs)
+                    elif method == "wait_for":
+                        # print(f"Waiting for CAN message: {args=}, {kwargs=} from {bus}")
+                        result = bus.wait_for(*args, **kwargs)
+                        controller_conn.send({"id": msg_id, "result": result})
+                    elif method == "ask":
+                        start_time = time.time()
+                        # print(f"Control dispatcher at 0s: Asking for CAN message: {args=}, {kwargs=} from {bus}")
+                        # print(f"{bus._msg_buffer=}")
+                        try:
+                            result = bus.ask(*args, **kwargs)
+                            # print(f"Control dispatcher at {time.time() - start_time}s: Received CAN message: {result}")
+                            controller_conn.send({"id": msg_id, "result": result})
+                        except Exception:
+                            # print(f"Control dispatcher at {time.time() - start_time}s: Exception while asking for CAN message")
+                            raise
+                    elif method == "flush":
+                        # print(f"Asking for CAN message: {args=}, {kwargs=} from {bus}")
+                        bus.flush()
+                    elif method == "close":
+                        # print(f"Asking for CAN message: {args=}, {kwargs=} from {bus}")
+                        bus.close()
+                    else:
+                        raise TypeError(f"Motion controller: Received unknown CAN method: {method}")
+                else:
+                    raise TypeError(f"Motion controller: Received unknown protocol: {protocol}")
+
+            if control_loop_active:
+                # TODO: Optimization attempt: fire off encoder request before trajectory interpolation, collect answers after
+                # for axis in AXES:
+                #     bus.send(axis2canid(axis), "encoder")
+
+                # Get the positions and speeds for the current time
+                if  current_trajectory is not None:
+                    planned_positions, planned_speeds = get_positions_and_speeds(current_trajectory, elapsed_time)
+
+                # TODO optimization attempt: part 2 (collecting encoder answers) -- somehow runs into timeout
+                # curr_positions = [None] * arm.NUM_AXES
+                # for axis in AXES:
+                #     # Get the current position
+                #     # curr_pos = update_motor_angles(bus, axis=axis)
+                #     (encoder,) = bus.wait_for(axis2canid(axis), "encoder", timeout=0.1)  # TODO: increase timeout? should not be that slow!
+                #     curr_positions[axis] = encoder_to_motor_angle(encoder)
+
+                # Control the arm with planned positions and speeds for the axes
+                for axis in AXES:
+                    # Get the current position
+                    curr_pos = update_motor_angles(bus, axis=axis)
+                    # curr_pos = curr_positions[axis]
+
+                    if planned_positions[axis] is None:  # No planned position: keep current position
+                        planned_positions[axis] = curr_pos
+
+                    planned_speed = planned_speeds[axis]
+                    planned_position = planned_positions[axis]
+
+                    # Calculate the PID error
+                    pid_error = pid[axis](planned_position, curr_pos,
+                                          dt * 60)  # *60 is just arbitrary scaling to have sensible PID values
+                    # print(f"{elapsed_time=}, {axis=}: {curr_pos=}, {planned_position=}, {dt=}, {planned_position-curr_pos=}, {pid_error=}")
+
+                    adjusted_speed = planned_speed_mixin * planned_speed + (1 - planned_speed_mixin) * pid_error
+                    adjusted_speed = constrain(adjusted_speed, -arm.AXES_SPEED_LIMIT[axis], arm.AXES_SPEED_LIMIT[axis])
+                    if abs(adjusted_speed) < speed_threshold:
+                        adjusted_speed = 0
+                    direction = 1 if adjusted_speed > 0 else 0
+                    direction = 1 - direction if arm.AXES_RAW_DIRECTION[axis] else direction
+                    accel = arm.AXES_ACCEL_LIMIT[axis]
+                    # print(f"Axis {axis}: {direction=}, {adjusted_velocity=}, {accel=}")
+                    bus.flush()  # optimization attempt
+                    bus.send(axis2canid(axis), "move", [direction, abs(adjusted_speed), accel])
+                    # bus.ask(axis2canid(axis), "move", [direction, abs(adjusted_speed), accel], answer_pattern=[None])
+                    planned_speeds[axis] = adjusted_speed
+                    planned_positions[axis] = curr_pos
+
+                # TODO: re-enable idling after debugging
+                # # Stop all axes after a short while if no movement is planned
+                # if current_trajectory is None and (last_stop_time - elapsed_time)*60 >= 1.0:
+                #     print("Trajectory control entering sleep mode.")
+                #     stop_all(bus=bus)
+                #     last_stop_time = -1
+                #     control_loop_active = False
+
+            # Wait for the next tick (incoming control message overrules waiting)
+            dt = (time.time() - last_tick) * one_sixtieth
+            message_waiting = False  # flag to make sure that we only poll once per loop
+            while not(dt > tick_len or message_waiting):
+                # time.sleep(0.005)
+                dt = (time.time() - last_tick) * one_sixtieth
+                message_waiting = controller_conn.poll()
+            elapsed_time += dt
+            last_tick = time.time()
+
+
+
+# def get_control_state():
+#     """Get the current state of the control loop."""
+#     if control_process is None:
+#         return "stopped"
+#     motion_conn.send({"protocol": "system", "data": "state"})
+#     if motion_conn.poll(timeout=1):
+#         return motion_conn.recv()
+#     return None
 
 def get_positions_and_speeds(trajectory: list[tuple[float, list[float], list[float]]], t: float, t0: float = 0.0) -> tuple[list[float], list[float]]:
     """Get the positions and speeds of all axes at a given time from a trajectory.
@@ -357,6 +780,7 @@ def get_positions_and_speeds(trajectory: list[tuple[float, list[float], list[flo
             # Trajectory waypoints are lists of axis values, each a tuple of time, position and speed
             t1 = trajectory[i][0]
             t2 = trajectory[i + 1][0]
+            inv_t2_minus_t1 = 1.0 / (t2 - t1)  # optimization attempt
             positions: list[float] = []
             speeds: list[float] = []
             for p1, s1, p2, s2 in zip(*trajectory[i][1:], *trajectory[i + 1][1:]):
@@ -365,8 +789,8 @@ def get_positions_and_speeds(trajectory: list[tuple[float, list[float], list[flo
                     positions.append(p1)
                     speeds.append(s1)
                 elif t1 <= t < t2:
-                    positions.append(p1 + (p2 - p1) * (t - t1) / (t2 - t1))
-                    speeds.append(s1 + (s2 - s1) * (t - t1) / (t2 - t1))
+                    positions.append(p1 + (p2 - p1) * (t - t1) * inv_t2_minus_t1)  # / (t2 - t1))
+                    speeds.append(s1 + (s2 - s1) * (t - t1) * inv_t2_minus_t1)  # / (t2 - t1))
             return positions, speeds
     return trajectory[-1][1], trajectory[-1][2]  # In case something goes wrong with the time comparison
 
@@ -443,8 +867,8 @@ def get_curr_motor_positions(bus=None):
     :param bus: the bus object to use for communication (default: current_bus)
     :return: list of motor positions in degrees for all axes
     """
-    if bus is None:
-        bus = current_bus.get()
+    bus = bus or current_bus.get()
+    # print(f"get_curr_motor_positions got bus: {bus}")
     curr_pos = [0] * arm.NUM_AXES
     for axis in AXES:
         (encoder_value,) = bus.ask(axis2canid(axis), "encoder")
@@ -707,55 +1131,74 @@ def send_axes(axes_or_messages=None, cmd=None, values=None, answer_pattern=None,
     return result
 
 if __name__ == "__main__":
-    from mks_bus import Bus
-    bus = Bus()
-    print(get_curr_motor_positions(bus))
-    send_axes(cmd="release_shaft_lock", bus=bus, answer_pattern=[None])
-    send_axes(cmd="set_zero", bus=bus, answer_pattern=[None])
-    # send_axes(cmd="zero_mode", values=[2, 1, 0, 0], bus=bus, answer_pattern=[1])
-    print(get_curr_motor_positions(bus))
-    axis = 0
-    force_end_pos = True
-    pos = [None, None, None, None, None, None]
-    pos[axis] = 3000
-    move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
-    time.sleep(1)
-    # print("correcting...")
-    # move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
-    # time.sleep(2)
-    pos = [None, None, None, None, None, None]
-    pos[axis] = 0
-    move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
-    time.sleep(1)
-    bus.close()
+    from mks_bus import encoder_to_motor_angle, motor_angle_to_encoder
+    from motion import BusProxy
+    bus = BusProxy()
+    motor_pos = [encoder_to_motor_angle(bus.ask(axis, "encoder")[0]) for axis in range(1, 7)]
+    print(f"Motor positions: {motor_pos}")
 
-    never = False
-    if never:
-        from mks_bus import Bus
-        bus = Bus()
-        print(get_curr_motor_positions(bus))
-        send_axes(cmd="release_shaft_lock", bus=bus, answer_pattern=[None])
-        send_axes(cmd="set_zero", bus=bus, answer_pattern=[None])
-        # send_axes(cmd="zero_mode", values=[2, 1, 0, 0], bus=bus, answer_pattern=[1])
-        print(get_curr_motor_positions(bus))
-        axes = [1]
-        send_axes(axes, cmd="set_direction", values=[1], bus=bus, answer_pattern=[1])
-        print("before move_to", get_curr_motor_positions(bus))
-        send_axes(axes, cmd="move_to", values=[500, 100, 0x4000], bus=bus, answer_pattern=[[0], [2], [3]])
-        print("after move_to", get_curr_motor_positions(bus))
-        send_axes(axes, cmd="move_to", values=[500, 100, 0], bus=bus, answer_pattern=[[0], [2], [3]])
+    # with Bus() as bus:
+    #     bus.send(1, "move", [0, 200, 150])
+    #     # bus.send(1, "move_by", [0, 150, 50])
 
-        print("before move", get_curr_motor_positions(bus))
-        send_axes(axes, cmd="move", values=[0, 100, 50], bus=bus)
-        time.sleep(1.5)
-        send_axes(axes, cmd="move", values=[0, 0, 50], bus=bus, answer_pattern=[[0], [2], [3]])
-        print("after move", get_curr_motor_positions(bus))
-        send_axes(axes, cmd="move_to", values=[500, 100, 0], bus=bus, answer_pattern=[[0], [2], [3]])
+    # with BusProxy() as bus:
+    #     print(f"Control process: {control_process}")
+    #     time.sleep(5)
+    #     bus.send(1, "move", [0, 200, 150])
+    #     time.sleep(5)
+    #     bus.send(1, "move", [0, 0, 150])
+    #     time.sleep(5)
 
-        force_end_pos=True
-        pos = [0, -2000, 0, 0, 0, 0]
-        move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
-        move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
-        pos = [None, 4000, None, None, None, None]
-        move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
-        move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
+
+#     from mks_bus import Bus
+#     bus = Bus()
+#     print(get_curr_motor_positions(bus))
+#     send_axes(cmd="release_shaft_lock", bus=bus, answer_pattern=[None])
+#     send_axes(cmd="set_zero", bus=bus, answer_pattern=[None])
+#     # send_axes(cmd="zero_mode", values=[2, 1, 0, 0], bus=bus, answer_pattern=[1])
+#     print(get_curr_motor_positions(bus))
+#     axis = 0
+#     force_end_pos = True
+#     pos = [None, None, None, None, None, None]
+#     pos[axis] = 3000
+#     move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
+#     time.sleep(1)
+#     # print("correcting...")
+#     # move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
+#     # time.sleep(2)
+#     pos = [None, None, None, None, None, None]
+#     pos[axis] = 0
+#     move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
+#     time.sleep(1)
+#     bus.close()
+#
+#     never = False
+#     if never:
+#         from mks_bus import Bus
+#         bus = Bus()
+#         print(get_curr_motor_positions(bus))
+#         send_axes(cmd="release_shaft_lock", bus=bus, answer_pattern=[None])
+#         send_axes(cmd="set_zero", bus=bus, answer_pattern=[None])
+#         # send_axes(cmd="zero_mode", values=[2, 1, 0, 0], bus=bus, answer_pattern=[1])
+#         print(get_curr_motor_positions(bus))
+#         axes = [1]
+#         send_axes(axes, cmd="set_direction", values=[1], bus=bus, answer_pattern=[1])
+#         print("before move_to", get_curr_motor_positions(bus))
+#         send_axes(axes, cmd="move_to", values=[500, 100, 0x4000], bus=bus, answer_pattern=[[0], [2], [3]])
+#         print("after move_to", get_curr_motor_positions(bus))
+#         send_axes(axes, cmd="move_to", values=[500, 100, 0], bus=bus, answer_pattern=[[0], [2], [3]])
+#
+#         print("before move", get_curr_motor_positions(bus))
+#         send_axes(axes, cmd="move", values=[0, 100, 50], bus=bus)
+#         time.sleep(1.5)
+#         send_axes(axes, cmd="move", values=[0, 0, 50], bus=bus, answer_pattern=[[0], [2], [3]])
+#         print("after move", get_curr_motor_positions(bus))
+#         send_axes(axes, cmd="move_to", values=[500, 100, 0], bus=bus, answer_pattern=[[0], [2], [3]])
+#
+#         force_end_pos=True
+#         pos = [0, -2000, 0, 0, 0, 0]
+#         move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
+#         move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
+#         pos = [None, 4000, None, None, None, None]
+#         move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
+#         move_to_motor_position(pos, force_end_pos=force_end_pos, bus=bus)
