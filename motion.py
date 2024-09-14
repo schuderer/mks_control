@@ -1,5 +1,6 @@
 import time
 from contextvars import ContextVar
+from datetime import datetime
 from functools import cache
 from math import sqrt
 import multiprocessing
@@ -474,10 +475,11 @@ def stop_control():
 
 def control_trajectory(controller_conn: Connection, bus_args: dict):
     print("Motion controller: Initializing")
-    tick_len = 0.1 / 60.0  # in minutes (due to RPM units)
+    tick_len = 0.05 / 60.0  # in minutes (due to RPM units)
     # Run loop to move all axes to the target position
     last_tick = time.time()
     dt = tick_len  # in minutes (due to RPM units)
+    one_sixtieth = 1.0 / 60.0
     elapsed_time = 0  # in minutes (due to RPM units)
     last_stop_time = 0  # when the last trajectory has ended (used for sleep timeout)
     last_info_update = 0
@@ -505,6 +507,7 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
         "state": STOPPED,
         "angle": None,
         "locked": None,
+        "timestamp": None,
     } for axis in range(arm.NUM_AXES)]
     message_waiting = False  # flag to make sure that we only poll controller_conn once per loop
 
@@ -536,6 +539,7 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
             except TimeoutError as e:
                 print(f"WARNING: Motion controller got no answer from CAN ID {axis2canid(axis)} when asking for motor_status: {e}")
                 return
+            motor_state[axis]["timestamp"] = datetime.utcnow()
         if axis is not None:
             return motor_state[axis]["state"]
 
@@ -589,11 +593,11 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
         update_all_motor_info(bus)
         while True:
             # TODO: catch and handle non-fatal errors on this level
-            if (elapsed_time - last_heartbeat) * 60 >= 1.0:  # every second (should be every 10 seconds or so eventually)
+            if (elapsed_time - last_heartbeat) * 60 >= 1.0:  # TODO (should be every 10 seconds or so eventually)
                 print(f"Motion controller: Heartbeat {60*dt=}, {elapsed_time=}, {planned_positions=}, {planned_speeds=}, {current_trajectory=}, {motion_conn=}")
                 last_heartbeat = elapsed_time
 
-            if (elapsed_time - last_info_update) * 60 >= 200.0:  # TODO: change to every second, but make sure that main program maintains its own always-up-to-date motor state
+            if (elapsed_time - last_info_update) * 60 >= 1.1:  # TODO: make sure that main program maintains its own always-up-to-date motor state
                 if not control_loop_active:
                     update_motor_angles(bus)  # Gets updated by the loop itself, saves one transaction per device
                 update_motor_states(bus)
@@ -681,14 +685,27 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
                     raise TypeError(f"Motion controller: Received unknown protocol: {protocol}")
 
             if control_loop_active:
+                # TODO: Optimization attempt: fire off encoder request before trajectory interpolation, collect answers after
+                # for axis in AXES:
+                #     bus.send(axis2canid(axis), "encoder")
+
                 # Get the positions and speeds for the current time
                 if  current_trajectory is not None:
                     planned_positions, planned_speeds = get_positions_and_speeds(current_trajectory, elapsed_time)
+
+                # TODO optimization attempt: part 2 (collecting encoder answers) -- somehow runs into timeout
+                # curr_positions = [None] * arm.NUM_AXES
+                # for axis in AXES:
+                #     # Get the current position
+                #     # curr_pos = update_motor_angles(bus, axis=axis)
+                #     (encoder,) = bus.wait_for(axis2canid(axis), "encoder", timeout=0.1)  # TODO: increase timeout? should not be that slow!
+                #     curr_positions[axis] = encoder_to_motor_angle(encoder)
 
                 # Control the arm with planned positions and speeds for the axes
                 for axis in AXES:
                     # Get the current position
                     curr_pos = update_motor_angles(bus, axis=axis)
+                    # curr_pos = curr_positions[axis]
 
                     if planned_positions[axis] is None:  # No planned position: keep current position
                         planned_positions[axis] = curr_pos
@@ -709,7 +726,9 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
                     direction = 1 - direction if arm.AXES_RAW_DIRECTION[axis] else direction
                     accel = arm.AXES_ACCEL_LIMIT[axis]
                     # print(f"Axis {axis}: {direction=}, {adjusted_velocity=}, {accel=}")
-                    bus.ask(axis2canid(axis), "move", [direction, abs(adjusted_speed), accel], answer_pattern=[None])
+                    bus.flush()  # optimization attempt
+                    bus.send(axis2canid(axis), "move", [direction, abs(adjusted_speed), accel])
+                    # bus.ask(axis2canid(axis), "move", [direction, abs(adjusted_speed), accel], answer_pattern=[None])
                     planned_speeds[axis] = adjusted_speed
                     planned_positions[axis] = curr_pos
 
@@ -722,11 +741,12 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
                 #     control_loop_active = False
 
             # Wait for the next tick (incoming control message overrules waiting)
-            dt = 0
+            dt = (time.time() - last_tick) * one_sixtieth
             message_waiting = False  # flag to make sure that we only poll once per loop
-            while not(dt > tick_len or (message_waiting := controller_conn.poll())):
-                dt = (time.time() - last_tick) / 60.0
-                time.sleep(0.01)
+            while not(dt > tick_len or message_waiting):
+                # time.sleep(0.005)
+                dt = (time.time() - last_tick) * one_sixtieth
+                message_waiting = controller_conn.poll()
             elapsed_time += dt
             last_tick = time.time()
 
@@ -760,6 +780,7 @@ def get_positions_and_speeds(trajectory: list[tuple[float, list[float], list[flo
             # Trajectory waypoints are lists of axis values, each a tuple of time, position and speed
             t1 = trajectory[i][0]
             t2 = trajectory[i + 1][0]
+            inv_t2_minus_t1 = 1.0 / (t2 - t1)  # optimization attempt
             positions: list[float] = []
             speeds: list[float] = []
             for p1, s1, p2, s2 in zip(*trajectory[i][1:], *trajectory[i + 1][1:]):
@@ -768,8 +789,8 @@ def get_positions_and_speeds(trajectory: list[tuple[float, list[float], list[flo
                     positions.append(p1)
                     speeds.append(s1)
                 elif t1 <= t < t2:
-                    positions.append(p1 + (p2 - p1) * (t - t1) / (t2 - t1))
-                    speeds.append(s1 + (s2 - s1) * (t - t1) / (t2 - t1))
+                    positions.append(p1 + (p2 - p1) * (t - t1) * inv_t2_minus_t1)  # / (t2 - t1))
+                    speeds.append(s1 + (s2 - s1) * (t - t1) * inv_t2_minus_t1)  # / (t2 - t1))
             return positions, speeds
     return trajectory[-1][1], trajectory[-1][2]  # In case something goes wrong with the time comparison
 

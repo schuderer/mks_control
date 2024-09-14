@@ -35,9 +35,10 @@ ACTIONS = {
         "left":       (("move", [0, 200, 150]), MOVING),
         "right":      (("move", [1, 200, 150]), MOVING),
         "home_axis":  (lambda axis: home(axis), HOMING),
-        "home_all":   (lambda _: home_all(), HOMING),
+        "home_all":   (lambda _: home_all(zero_pose=arm.MOVE_ZERO_AFTER_HOME), HOMING),
         "play_pause": (lambda _: play_pause(), PLAYBACK),
         "input":      (lambda axis: input_angle(axis), STOPPED),
+        "go_to_saved_position":      (lambda axis: go_to_saved_position(), STOPPED),
         "move_all_to_zero": (lambda _: move_to_motor_position(motor_angles_abs([0] * arm.NUM_AXES), bus=current_bus_proxy.get()), STOPPED),
         "release_lock": (("release_shaft_lock", []), STOPPED),
         "set_zero":   (("set_zero", []), STOPPED),
@@ -46,7 +47,9 @@ ACTIONS = {
         "stop":       (("move", [0, 0, 150]), STOPPING),
     },
     STOPPING: {
-        # No commands allowed, wait for stop
+        # Underscore prefix = default action, auto-fires when no other action is specified
+        # Target state None = don't change state (action is responsible for state transition)
+        "_check_stopped": (lambda axis: check_stopped(axis), None),
     },
     HOMING: {
         # No commands allowed, wait for homing
@@ -134,6 +137,8 @@ def on_release(key):
         sequence.clear()
     if key == keyboard.Key.enter:
         next_command[active_axis] = "input"
+    if key == keyboard.KeyCode.from_char('g'):
+        next_command[active_axis] = "go_to_saved_position"
     if key == keyboard.KeyCode.from_char('0'):
         next_command[active_axis] = "move_all_to_zero"
     if key == keyboard.KeyCode.from_char('0'):
@@ -166,7 +171,8 @@ def print_devices():
         print(f"{axis + 1}: {pretty_data}")
 
 
-def input_angle(axis):
+def input_angle(axis, bus=None):
+    bus = bus or current_bus_proxy.get()
     keyboard_listener.stop()
     time.sleep(1)
     try:
@@ -180,7 +186,7 @@ def input_angle(axis):
         time.sleep(1)
         start_keyboard_listener()
         return
-    move_to_motor_position(motor_angles, override=True, bus=current_bus_proxy.get())
+    move_to_motor_position(motor_angles, override=True, bus=bus)
     # bus.ask(axis2canid(active_axis), "move_to", [600, 50, motor_angle_to_encoder(new_motor_angle)], answer_pattern=[[0], [2], [3]],
     #         timeout=arm.AXES_MOVE_TIMEOUT[active_axis])
     start_keyboard_listener()
@@ -194,8 +200,39 @@ def save_position():
         time.sleep(1)
         return
     sequence.append(joint_pos)
-    print(f"Saved position {len(sequence)}")
+    print(f"Saved position {len(sequence)}:\n{joint_pos}")
 
+
+def go_to_saved_position(bus=None):
+    bus = bus or current_bus_proxy.get()
+    keyboard_listener.stop()
+    time.sleep(1)
+    pos_idx = None
+    try:
+        global sequence
+        if len(sequence) == 0:
+            sequence = arm.ARM_DEMO_SEQUENCE
+        pos_idx = input(f"Enter position number to go to (0 to {len(sequence)-1}): ")
+        joint_pos = sequence[int(pos_idx)]
+        motor_pos = motor_angles_abs(joint_pos)
+        move_to_motor_position(motor_pos, bus=bus)
+
+        print("Waiting for end of trajectory...")
+        while (s := bus.get_state()["mode"]) != "idle":
+            print(f"Waiting for end of trajectory. Current motion controller state: {s}")
+            time.sleep(1)
+    except ValueError as e:
+        print(f"Invalid number: {pos_idx} ({e})")
+    finally:
+        time.sleep(1)
+        start_keyboard_listener()
+
+
+def check_stopped(axis, bus=None):
+    bus = bus or current_bus_proxy.get()
+    (motor_status_code,) = bus.ask(axis2canid(axis), "motor_status", timeout=5.0)
+    if motor_status_code == 1:
+        state[axis] = STOPPED
 
 def play_pause(bus=None):
     bus = bus or current_bus_proxy.get()
@@ -211,14 +248,14 @@ def play_pause(bus=None):
         else:
             state[axis] = PLAYBACK
     start_pos = None  # Initially start from current position
-    for i, position in enumerate(sequence):
-        motor_pos = motor_angles_abs(position)
-        print(f"Planning position {i + 1}")
-        # Important to update the start_pos with the previous end position
-        start_pos = move_to_motor_position(motor_pos, start_pos=start_pos, bus=bus)
-        print(f"Position {i + 1} planned")
+    for j in range(3):  # TODO: remove this
+        for i, position in enumerate(sequence):
+            motor_pos = motor_angles_abs(position)
+            print(f"Planning position {i + 1}")
+            # Important to update the start_pos with the previous end position
+            start_pos = move_to_motor_position(motor_pos, start_pos=start_pos, bus=bus)
+            print(f"Position {i + 1} planned")
 
-    # TODO: Wait for trajectory completion
     print("Waiting for end of trajectory...")
     while (s := bus.get_state()["mode"]) != "idle":
         print(f"Waiting for end of trajectory. Current motion controller state: {s}")
@@ -235,74 +272,34 @@ def play_pause(bus=None):
 def update_state_from_devices(bus=None):
     bus = bus or current_bus_proxy.get()
     global state, axis_data
-    # if any([state[axis] in [INIT, HOMING, PLAYBACK] for axis in AXES]):
-    #     return
-    # time.sleep(0.05)
-    # motor_angles = [0] * arm.NUM_AXES
-    # new_state = state.copy()
-    # new_axis_data = deepcopy(axis_data)
 
     retrieved_state = bus.get_state()["motors"]
-    #     motor_state: list[dict[str, Optional[Any]]] = [{
-    #         "can_id": axis2canid(axis),
-    #         "state": STOPPED,
-    #         "angle": None,
-    #         "locked": None,
-    # } for axis in range(arm.NUM_AXES)]
+    low_level_state = [retrieved_state[axis]["state"] for axis in AXES]
+    for axis in AXES:
+        ll_state = low_level_state[axis]
+        if state[axis] in [INIT, HOMING, PLAYBACK]:
+            # Don't meddle with high-level states
+            continue
+        if state[axis] in [STOPPED]:
+            state[axis] = ll_state
 
-    state = [retrieved_state[axis]["state"] for axis in AXES]
     motor_angles = [retrieved_state[axis]["angle"] for axis in AXES]
     joint_angles = joint_angles_abs(motor_angles)
     for axis in AXES:
         motor_lock_state = retrieved_state[axis]["locked"]
         pretty_state = format(f"{state[axis]}", "<12")
+        timestamp = retrieved_state[axis]["timestamp"]
+        pretty_timestamp = timestamp.strftime("%H:%M:%S.%f")[:-3] if timestamp is not None else None
         axis_data[axis].update(
             motor_angle=motor_angles[axis],
             angle=joint_angles[axis],
             state=pretty_state,
             shaft_lock=motor_lock_state,
-            timestamp=timestamp()
+            timestamp=pretty_timestamp
         )
 
-    # for axis in AXES:
-    #     try:
-    #         (encoder,) = bus.ask(axis2canid(axis), "encoder", timeout=0.1)
-    #         angle = encoder_to_motor_angle(encoder)
-    #         motor_angles[axis] = angle
-    #     except TimeoutError as e:
-    #         print(f"No answer from CAN ID {axis2canid(axis)} when asking for encoder: {e}")
-    #         return
-    #
-    #     try:
-    #         (motor_state,) = bus.ask(axis2canid(axis), "motor_status", timeout=0.1)
-    #         # 0: error, 1: stopped, 2: accelerate, 3: decelerate, 4: full speed, 5: homing
-    #         # print(f"Motor state: {motor_state}")
-    #         print(motor_state)
-    #         new_state[axis] = [ERROR, STOPPED, MOVING, STOPPING, MOVING, MOVING][motor_state]
-    #         pretty_state = format(f"{new_state[axis]} ({motor_state})", "<12")
-    #         new_axis_data[axis].update(state=pretty_state, timestamp=timestamp())
-    #     except TimeoutError as e:
-    #         print(f"No answer from CAN ID {axis2canid(axis)} when asking for motor_status0: {e}")
-    #         return
-    #
-    #     try:
-    #         (lock_state,) = bus.ask(axis2canid(axis), "shaft_lock_status", timeout=0.1)
-    #         new_axis_data[axis].update(shaft_lock=lock_state, timestamp=timestamp())
-    #     except TimeoutError as e:
-    #         print(f"No answer from CAN ID {axis2canid(axis)} when asking for shaft_lock_status: {e}")
-    #         return
-    #
-    # state = new_state
-    # axis_data = new_axis_data
-    #
-    # joint_angles = joint_angles_abs(motor_angles)
-    # for axis in AXES:
-    #     axis_data[axis].update(motor_angle=motor_angles[axis], timestamp=timestamp())
-    #     axis_data[axis].update(angle=joint_angles[axis], timestamp=timestamp())
-
-
-def timestamp():
-    return datetime.utcnow().strftime("%H:%M:%S.%f")[:-3]
+# def timestamp():
+#     return datetime.utcnow().strftime("%H:%M:%S.%f")[:-3]
 
 
 def home(axis, bus=None):
@@ -317,8 +314,8 @@ def home(axis, bus=None):
         try:
             # If currently resting on endstop, move off the endstop for better accuracy
             (_, _, _, active_low_endstop) = bus.ask(can_id, "io_status")
-            if not active_low_endstop:
-                bus.ask(can_id, "move_by", [60, 50, -3000], answer_pattern=[2])
+            # if not active_low_endstop:  # TODO
+            #     bus.ask(can_id, "move_by", [60, 50, -3000], answer_pattern=[2])
             # Home to endstop
             bus.ask(can_id, "home", answer_pattern=[1])  # 1 = has started
             bus.wait_for(can_id, "home", timeout=arm.AXES_MOVE_TIMEOUT[axis], value_pattern=[2])
@@ -410,11 +407,20 @@ def execute_transitions(bus=None):
     print("ID Curr-state command  action  state-after-action")
     curr_cmd = next_command.copy()
     for axis in reversed(AXES):
+        curr_state = state[axis]
         can_id = axis2canid(axis)
-        action, new_state = ACTIONS[state[axis]].get(curr_cmd[axis], (None, state[axis]))
-        print(f"{can_id}: {state[axis]} -> {curr_cmd[axis]} -> {action},  {new_state}")
+        if curr_cmd[axis] not in ACTIONS[curr_state]:
+            try:
+                # Default action for current state
+                curr_cmd[axis] = [k for k in ACTIONS[curr_state].keys() if k.startswith("_")][0]
+            except IndexError:
+                pass
+                # print(f"No valid actions for state {curr_state}, command {curr_cmd[axis]} (axis {axis})")
+                # continue
+        action, new_state = ACTIONS[curr_state].get(curr_cmd[axis], (None, curr_state))
+        print(f"{can_id}: {curr_state} -> {curr_cmd[axis]} -> {action},  {new_state}")
         if action is not None:
-            state[axis] = new_state
+            state[axis] = new_state if new_state is not None else curr_state  # None state = action responsible for changing it
             if callable(action):
                 action(axis)
             else:
@@ -433,7 +439,7 @@ def init(axis, bus=None):
     bus.ask(can_id, "set_work_current", [arm.AXES_CURRENT_LIMIT[axis]], answer_pattern=[True])
     # bus.ask(can_id, "set_zero", answer_pattern=[1])
     global state
-    state[axis] = [STOPPED]
+    state[axis] = STOPPED
     # # for_all(lambda i: bus.send(i, "set_key_lock", [False]))  # what does this do?
 
 
@@ -447,7 +453,7 @@ def main():
         try:
             # start_control(bus=bus)
             while not quit_app:
-                if time.time() - tick > 0.3:
+                if time.time() - tick > 0.1:
                     os.system('clear')
                     print(f"{' '*85}{(time.time() - tick)*1000:.1f}ms tick")
                     print_devices()
@@ -455,12 +461,14 @@ def main():
                     print(f"Press up/down arrow keys to choose axis, left/right arrow keys to move, esc to quit.")
                     print(f"'l' to release lock, 'L' to release all locks, 'h' to home axis, 'H' to home all axes.")
                     print(f"'0' to move to zero pose, 'z' to zero axis, 'enter' to input angle for current axis.")
-                    print(f"'s' to save position in sequence, 'p' to play/pause sequence, 'c' to clear sequence.")
+                    print(f"'s' to save position in sequence, 'p' to play/pause sequence, 'c' to clear sequence,")
+                    print(f"'g' to go to saved position.")
                     print_axes()
                     print("\n\n")
                     execute_transitions(bus=bus)
                     update_state_from_devices(bus=bus)
                     joint_angles = [axis_data[axis]["angle"] for axis in AXES]
+                    print("Current position:", joint_angles)
                     # if not None in joint_angles:
                     #     chain.update_visualization(joint_angles, use_degrees=True)
                     tick = time.time()
