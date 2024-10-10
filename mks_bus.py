@@ -191,9 +191,28 @@ COMMANDS = {  # From "MKS SERVO42&57D_CAN User Manual V1.0.3.pdf"
         "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
     },
     "zero_mode": {  # In 0_Mode, the motor can automatically return to the 0 point position when power on. The maximum angle is 359 degrees.
-        # （Same as “0_Mode、Set 0、0_Speed、0_Dir” options on screen
+        # Same as “0_Mode、Set 0、0_Speed、0_Dir” options on screen
         "cmd": 0x9A,
         "tx_struct": "uintbe8, pad7,bool, uintbe8, pad7,bool",  # mode (0: disable, 1: go 0 with direction, 2: go 0 using nearest direction), enable (0: clear 0, 1: set 0), speed (0-4), direction (0: CW, 1: CCW)
+        "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
+    },
+    "set_hold_current": {  # Set holding current percentage (>= 1.0.4, only relevant in stepper modus)
+        # Same as the "HoldMa" option on screen
+        "cmd": 0x9B,
+        "tx_struct": "uintbe8",  # 00 = 10%, 01 = 20 %, ..., 08 = 90%
+        "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
+    },
+    "limit_port_remap": {  # Enable limit port remapping to add a right limit port (>= 1.0.4)
+        # (only for serial control mode)
+        # The 28/35/42D motor has only a left limit port. In serial control
+        # mode, limit port remapping can be enabled to add a right limit port.
+        # For the 57D motor, limit port remapping can also be enabled if
+        # required to facilitate wiring.
+        # Left limit -> En port
+        # Right limit -> Dir port
+        # The Com port must be connected to the corresponding high level.
+        "cmd": 0x9E,
+        "tx_struct": "pad7,bool",  # 0: disable, 1: enable
         "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
     },
     # Skipping a few
@@ -218,6 +237,12 @@ COMMANDS = {  # From "MKS SERVO42&57D_CAN User Manual V1.0.3.pdf"
         "cmd": 0xF6,
         "tx_struct": "bool, pad:3, uintbe12, uintbe8",  # Dir 0: CCW, 1: CW; Speed 0~3000 RPM; Accel 0~255
         "rx_struct": "uintbe8",  # Status: 0: fail, 1: started/stopping, 2: stop success
+    },
+    "stop": {  # Emergency stop (>= 1.0.4)
+        # Try to avoid this at more than 1000 RPM
+        "cmd": 0xF7,
+        "tx_struct": "",  # Nothing to send
+        "rx_struct": "pad7,bool",  # Status: 1: success, 0: fail
     },
     "save_clean_speed_param": {  # Save or clean the parameter in speed mode
         # Good to clean immediately at startup so that motor does not start moving when powered on

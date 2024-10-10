@@ -9,20 +9,20 @@ NUM_AXES = 6
 # AXES_ANGLE_RANGE = [4896, -32200, 22700, 1990.8, 2120, 2120]  # between 0 and this angle in degrees (may be negative)
 # AXES_ANGLE_RANGE = [4896, -32200, 22700, 1990.8, 2260.4, 2175.5]  # between 0 and this angle in degrees (may be negative)
 AXES_ANGLE_RANGE = [4896, -32200, 22700, 1850, 2260.4, 2175.5]  # between 0 and this angle in degrees (may be negative)
-
-# TODO:
-# - make native homing parameters configurable
+AXIS_INFINITE = [1, 0, 0, 0, 0, 0]  # Which axes can turn further than the range or beyond 0 in the opposite direction  # TODO use in limit checks
 
 # Motor parameters
+AXES_WORK_MODE = [5, 5, 5, 5, 5, 5]  # modes 0 through 5: CR_OPEN, CR_CLOSE, CR_vFOC, SR_OPEN, SR_CLOSE, SR_vFOC
+AXES_DIRECTION = [0, 0, 0, 0, 0, 0]  # CW(0), CCW(1)
 # The "move" command sometimes needs to be inverted, even though move_to works fine
-AXES_RAW_DIRECTION = [0, 0, 0, 0, 1, 1]  # 0: normal, 1: inverted
+# AXES_RAW_DIRECTION = [0, 0, 0, 0, 1, 1]  # 0: normal, 1: inverted  # TODO still necessary after init?
 AXES_CURRENT_LIMIT = [2000, 1600, 1400, 1000, 1000, 1000]  # in mA
 # AXES_SPEED_LIMIT = [600, 600, 600, 500, 300, 300, 300]  # in RPM
 # AXES_SPEED_LIMIT = [1200, 1200, 1200, 1200, 1000, 500, 500]  # in RPM  # Axes 0 and 3 are too fast
 AXES_SPEED_LIMIT = [1000, 1200, 1200, 1000, 1000, 500, 500]  # in RPM
 AXES_ACCEL_LIMIT = [200, 200, 200, 200, 200, 200, 200]  # 255-acc = number of 50us ticks between RPM increments by 1
 # AXES_ACCEL_LIMIT = [150, 150, 150, 150, 150, 150, 150]
-AXES_MOVE_TIMEOUT = [35, 35, 25, 18, 10, 10]  # in seconds
+AXES_MOVE_TIMEOUT = [35, 35, 25, 18, 13, 13]  # in seconds
 
 AXES_ANGLE_RATIO = [  # motor degrees per joint degree (or motor turns per joint turn)
     # row: input at motor shaft, column: result at joint
@@ -76,9 +76,12 @@ JOINT_ZERO_OFFSET = [0, -82.2, -35.1, -(180+33.4), 0, 0]  # in joint degrees (no
 # 1: can_id: None, state: stopped (1) , angle:    0.0, timestamp: 20:55:35.221, shaft_lock: False
 
 # Homing
-# We support a mixture of native endstop homing (value -1), sensorless homing (0, 1) or deactivated homing (None)
-ENDSTOP = -1; CW = 1; CCW = 0; NONE = None
-AXES_HOMING_DIRECTION = [ENDSTOP, CW, CCW, ENDSTOP, CW, CW]
+# We support a mixture of native endstop homing, sensorless homing or deactivated homing (None)
+SENSORLESS = 0; ENDSTOP = 1; CW = 0; CCW = 1; NONE = None; LOW = 0; HIGH = 1
+AXES_HOMING_MODE = [ENDSTOP, SENSORLESS, SENSORLESS, ENDSTOP, SENSORLESS, SENSORLESS]
+AXES_ENDSTOP_TRIGGER = [LOW, None, None, LOW, None, None]
+AXES_HOMING_DIRECTION = [CCW, CCW, CW, CCW, CCW, CCW]
+AXES_HOMING_SPEED = [90, 200, 300, 50, 30, 30]  # in RPM
 AXES_HOMING_CURRENT_LIMIT = [450, 450, 450, 450, 450, 500]  # in mA
 AXES_SAFE_HOMING_ANGLE = [AXES_ANGLE_RANGE[i] * factor for i, factor in enumerate([0, 0.25, 0.75, 0.5, 0.5, 0.5])]
 # order in which to home the axes (homing 3 twice to prevent collisions at first and to make it look neat in the end)
