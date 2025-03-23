@@ -316,6 +316,7 @@ def home(axis, bus=None):
             # (_, _, _, active_low_endstop) = bus.ask(can_id, "io_status")
             # if not active_low_endstop:
             #     bus.ask(can_id, "move_by", [60, 50, -3000], answer_pattern=[2])
+            
             # Home to endstop
             # TODO we might want to set these at initialization (only for endstop homing axes)
             bus.ask(can_id, "set_home_params", [

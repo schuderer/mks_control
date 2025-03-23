@@ -723,7 +723,7 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
                     if abs(adjusted_speed) < speed_threshold:
                         adjusted_speed = 0
                     direction = 1 if adjusted_speed > 0 else 0
-                    # direction = 1 - direction if arm.AXES_RAW_DIRECTION[axis] else direction  # TODO still necessary?                    accel = arm.AXES_ACCEL_LIMIT[axis]
+                    # direction = 1 - direction if arm.AXES_RAW_DIRECTION[axis] else direction  # TODO still necessary?
                     accel = arm.AXES_ACCEL_LIMIT[axis]
                     # print(f"Axis {axis}: {direction=}, {adjusted_velocity=}, {accel=}")
                     bus.flush()  # optimization attempt

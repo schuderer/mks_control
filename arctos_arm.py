@@ -9,7 +9,6 @@ NUM_AXES = 6
 # AXES_ANGLE_RANGE = [4896, -32200, 22700, 1990.8, 2120, 2120]  # between 0 and this angle in degrees (may be negative)
 # AXES_ANGLE_RANGE = [4896, -32200, 22700, 1990.8, 2260.4, 2175.5]  # between 0 and this angle in degrees (may be negative)
 AXES_ANGLE_RANGE = [4896, -32200, 22700, 1850, 2260.4, 2175.5]  # between 0 and this angle in degrees (may be negative)
-
 AXIS_INFINITE = [1, 0, 0, 0, 0, 0]  # Which axes can turn further than the range or beyond 0 in the opposite direction  # TODO use in limit checks
 
 # Motor parameters
@@ -77,9 +76,6 @@ JOINT_ZERO_OFFSET = [0, -82.2, -35.1, -(180+33.4), 0, 0]  # in joint degrees (no
 # 1: can_id: None, state: stopped (1) , angle:    0.0, timestamp: 20:55:35.221, shaft_lock: False
 
 # Homing
-# # We support a mixture of native endstop homing (value -1), sensorless homing (0, 1) or deactivated homing (None)
-# ENDSTOP = -1; CW = 1; CCW = 0; NONE = None
-# AXES_HOMING_DIRECTION = [ENDSTOP, CW, CCW, ENDSTOP, CW, CW]
 # We support a mixture of native endstop homing, sensorless homing or deactivated homing (None)
 SENSORLESS = 0; ENDSTOP = 1; CW = 0; CCW = 1; NONE = None; LOW = 0; HIGH = 1
 AXES_HOMING_MODE = [ENDSTOP, SENSORLESS, SENSORLESS, ENDSTOP, SENSORLESS, SENSORLESS]
