@@ -3,8 +3,6 @@ import sys
 import termios
 import time
 import traceback
-from copy import deepcopy
-from datetime import datetime
 from typing import Optional, Any
 
 from pynput import keyboard
@@ -306,12 +304,12 @@ def update_state_from_devices(bus=None):
 def home(axis, bus=None):
     bus = bus or current_bus_proxy.get()
     can_id = axis2canid(axis)
-    if arm.AXES_HOMING_DIRECTION[axis] is None:  # TODO: CFG: if arm.AXES_HOMING_MODE[axis] is arm.NONE:  # Homing disabled
+    if arm.AXES_HOMING_MODE[axis] is arm.NONE:  # Homing disabled
         print(f"Axis {axis} currently does not support homing")
         if state[axis] == HOMING:
             state[axis] = STOPPED
         return
-    elif arm.AXES_HOMING_DIRECTION[axis] == -1:  # TODO: CFG: elif arm.AXES_HOMING_MODE[axis] == arm.ENDSTOP:  # Native homing specified
+    elif arm.AXES_HOMING_MODE[axis] == arm.ENDSTOP:  # Native homing specified
         try:
             # TODO: is this really needed? It should be handled by the firmware
             # If currently resting on endstop, move off the endstop for better accuracy
@@ -319,15 +317,13 @@ def home(axis, bus=None):
             # if not active_low_endstop:
             #     bus.ask(can_id, "move_by", [60, 50, -3000], answer_pattern=[2])
             # Home to endstop
-            # TODO: CFG START
-            # # TODO we might want to set these at initialization (only for endstop homing axes)
-            # bus.ask(can_id, "set_home_params", [
-            #     arm.AXES_ENDSTOP_TRIGGER[axis],
-            #     arm.AXES_HOMING_DIRECTION[axis],
-            #     arm.AXES_HOMING_SPEED[axis],
-            #     1,  # 1 = enable endstop homing, 0 = disable
-            # ], answer_pattern=[True])
-            # TODO: CFG END
+            # TODO we might want to set these at initialization (only for endstop homing axes)
+            bus.ask(can_id, "set_home_params", [
+                arm.AXES_ENDSTOP_TRIGGER[axis],
+                arm.AXES_HOMING_DIRECTION[axis],
+                arm.AXES_HOMING_SPEED[axis],
+                1,  # 1 = enable endstop homing, 0 = disable
+            ], answer_pattern=[True])
             bus.ask(can_id, "home", answer_pattern=[1])  # 1 = has started
             bus.wait_for(can_id, "home", timeout=arm.AXES_MOVE_TIMEOUT[axis], value_pattern=[2])
             bus.ask(can_id, "set_zero", answer_pattern=[True])  # this should not be necessary, but it is :(
@@ -351,17 +347,17 @@ def home(axis, bus=None):
 def sensorless_home(axis, bus=None):
     bus = bus or current_bus_proxy.get()
     global state
-    if arm.AXES_HOMING_DIRECTION[axis] is None:  # TODO: CFG: if arm.AXES_HOMING_MODE[axis] != arm.SENSORLESS:
-        print(f"Axis {axis} currently does not support homing")  # TODO: CFG: print(f"Axis {axis} currently does not support sensorless homing")
+    if arm.AXES_HOMING_MODE[axis] != arm.SENSORLESS:
+        print(f"Axis {axis} currently does not support sensorless homing")
         if state[axis] == HOMING:
             state[axis] = STOPPED
         return
     try:
         can_id = axis2canid(axis)
-        bus.send(can_id, "set_work_current", [550])  # TODO: CFG: bus.send(can_id, "set_work_current", [arm.AXES_HOMING_CURRENT_LIMIT[axis]])
+        bus.send(can_id, "set_work_current", [arm.AXES_HOMING_CURRENT_LIMIT[axis]])
         bus.ask(can_id, "set_shaft_lock", [True], answer_pattern=[True])
         bus.ask(can_id, "release_shaft_lock")  # may also be False if already released, so no answer_pattern
-        bus.send(can_id, "move", [arm.AXES_HOMING_DIRECTION[axis], 250, 50])  # TODO: CFG: bus.send(can_id, "move", [arm.AXES_HOMING_DIRECTION[axis], arm.AXES_HOMING_SPEED[axis], 50])
+        bus.send(can_id, "move", [arm.AXES_HOMING_DIRECTION[axis], arm.AXES_HOMING_SPEED[axis], 50])
 
         start_time = time.time()
         locked = False
