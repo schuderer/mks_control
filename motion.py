@@ -1131,11 +1131,12 @@ def send_axes(axes_or_messages=None, cmd=None, values=None, answer_pattern=None,
     return result
 
 if __name__ == "__main__":
-    from mks_bus import encoder_to_motor_angle, motor_angle_to_encoder
-    from motion import BusProxy
-    bus = BusProxy()
-    motor_pos = [encoder_to_motor_angle(bus.ask(axis, "encoder")[0]) for axis in range(1, 7)]
-    print(f"Motor positions: {motor_pos}")
+    ...
+    # from mks_bus import encoder_to_motor_angle, motor_angle_to_encoder
+    # from motion import BusProxy
+    # bus = BusProxy()
+    # motor_pos = [encoder_to_motor_angle(bus.ask(axis, "encoder")[0]) for axis in range(1, 7)]
+    # print(f"Motor positions: {motor_pos}")
 
     # with Bus() as bus:
     #     bus.send(1, "move", [0, 200, 150])
