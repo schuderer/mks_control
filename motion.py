@@ -723,7 +723,6 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
                     if abs(adjusted_speed) < speed_threshold:
                         adjusted_speed = 0
                     direction = 1 if adjusted_speed > 0 else 0
-                    # direction = 1 - direction if arm.AXES_RAW_DIRECTION[axis] else direction  # TODO still necessary?
                     accel = arm.AXES_ACCEL_LIMIT[axis]
                     # print(f"Axis {axis}: {direction=}, {adjusted_velocity=}, {accel=}")
                     bus.flush()  # optimization attempt
@@ -732,13 +731,12 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
                     planned_speeds[axis] = adjusted_speed
                     planned_positions[axis] = curr_pos
 
-                # TODO: re-enable idling after debugging
-                # # Stop all axes after a short while if no movement is planned
-                # if current_trajectory is None and (last_stop_time - elapsed_time)*60 >= 1.0:
-                #     print("Trajectory control entering sleep mode.")
-                #     stop_all(bus=bus)
-                #     last_stop_time = -1
-                #     control_loop_active = False
+                # Stop all axes after a short while if no movement is planned
+                if current_trajectory is None and (last_stop_time - elapsed_time)*60 >= 1.0:
+                    print("Trajectory control entering sleep mode.")
+                    stop_all(bus=bus)
+                    last_stop_time = -1
+                    control_loop_active = False
 
             # Wait for the next tick (incoming control message overrules waiting)
             dt = (time.time() - last_tick) * one_sixtieth

@@ -247,7 +247,7 @@ def play_pause(bus=None):
         else:
             state[axis] = PLAYBACK
     start_pos = None  # Initially start from current position
-    for j in range(3):  # TODO: remove this
+    for j in range(3):  # TODO: arbitrarily loops 3 times -- eventually remove this
         for i, position in enumerate(sequence):
             motor_pos = motor_angles_abs(position)
             print(f"Planning position {i + 1}")
@@ -311,12 +311,6 @@ def home(axis, bus=None):
         return
     elif arm.AXES_HOMING_MODE[axis] == arm.ENDSTOP:  # Native homing specified
         try:
-            # TODO: is this really needed? It should be handled by the firmware
-            # If currently resting on endstop, move off the endstop for better accuracy
-            # (_, _, _, active_low_endstop) = bus.ask(can_id, "io_status")
-            # if not active_low_endstop:
-            #     bus.ask(can_id, "move_by", [60, 50, -3000], answer_pattern=[2])
-            
             # Home to endstop
             # TODO we might want to set these at initialization (only for endstop homing axes)
             bus.ask(can_id, "set_home_params", [
