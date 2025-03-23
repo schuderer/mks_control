@@ -15,7 +15,7 @@ AXIS_INFINITE = [1, 0, 0, 0, 0, 0]  # Which axes can turn further than the range
 AXES_WORK_MODE = [5, 5, 5, 5, 5, 5]  # modes 0 through 5: CR_OPEN, CR_CLOSE, CR_vFOC, SR_OPEN, SR_CLOSE, SR_vFOC
 AXES_DIRECTION = [0, 0, 0, 0, 0, 0]  # CW(0), CCW(1)
 # The "move" command sometimes needs to be inverted, even though move_to works fine
-# AXES_RAW_DIRECTION = [0, 0, 0, 0, 1, 1]  # 0: normal, 1: inverted  # TODO still necessary after init?
+AXES_RAW_DIRECTION = [0, 0, 0, 0, 1, 1]  # 0: normal, 1: inverted  # TODO why still necessary after init???
 AXES_CURRENT_LIMIT = [2000, 1600, 1400, 1000, 1000, 1000]  # in mA
 # AXES_SPEED_LIMIT = [600, 600, 600, 500, 300, 300, 300]  # in RPM
 # AXES_SPEED_LIMIT = [1200, 1200, 1200, 1200, 1000, 500, 500]  # in RPM  # Axes 0 and 3 are too fast

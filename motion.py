@@ -275,6 +275,7 @@ class PIDController:
         self.kP = kP
         self.kI = kI
         self.kD = kD
+        self.epsilon = 1e-2
         if max_I < 0 or max_error < 0:
             raise ValueError("max_I and max_error must be positive.")
         self.max_I = max_I
@@ -300,10 +301,15 @@ class PIDController:
         # P: Calculate the proportional error between the target and current position
         error = setpoint - curr
         error = constrain(error, -self.max_error, self.max_error)  # Saturation to prevent extremes
+        if abs(error) < self.epsilon:
+            error = 0.0  # deadband
 
         # I: Calculate the integral of the position error
-        self.integral_error += error * dt
-        self.integral_error = constrain(self.integral_error, -self.max_I, self.max_I)  # Saturation to prevent windup
+        if error != 0.0:
+            self.integral_error += error * dt
+            self.integral_error = constrain(self.integral_error, -self.max_I, self.max_I)  # Saturation to prevent windup
+        else:
+            self.integral_error *= 0.9  # decay integral
 
         # D: Calculate the differential of the position error
         if self.prev_error is None:
@@ -313,6 +319,7 @@ class PIDController:
 
         # Calculate the PID control signal
         pid_error = self.kP * error + self.kI * self.integral_error + self.kD * diff_error
+        # print(f"[PID] setpoint={setpoint:.3f}, curr={curr:.3f}, error={error:.3f}, pid_error={pid_error:.3f}, integral={self.integral_error:.3f}, diff={diff_error:.3f}")
         # print(f"{self.kP * error=} + {self.kI * self.integral_error=} + {self.kD=} * {diff_error=} = {pid_error=}")
         return pid_error
 
@@ -715,7 +722,8 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
                     # Calculate the PID error
                     pid_error = pid[axis](planned_position, curr_pos,
                                           dt * 60)  # *60 is just arbitrary scaling to have sensible PID values
-                    # TODO: check whether pid_error is under epsilon, only do corrections if necessary
+                    if current_trajectory is None and abs(pid_error) > 3.0:
+                        print(f"[DRIFT WARNING] Axis {axis}: PID error {pid_error:.3f} at idle. Planned pos={planned_positions[axis]:.3f}, curr pos={curr_pos:.3f}")
                     # print(f"{elapsed_time=}, {axis=}: {curr_pos=}, {planned_position=}, {dt=}, {planned_position-curr_pos=}, {pid_error=}")
 
                     adjusted_speed = planned_speed_mixin * planned_speed + (1 - planned_speed_mixin) * pid_error
@@ -723,13 +731,16 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
                     if abs(adjusted_speed) < speed_threshold:
                         adjusted_speed = 0
                     direction = 1 if adjusted_speed > 0 else 0
+                    direction = 1 - direction if arm.AXES_RAW_DIRECTION[axis] else direction  # TODO why is this hack still necessary?
                     accel = arm.AXES_ACCEL_LIMIT[axis]
                     # print(f"Axis {axis}: {direction=}, {adjusted_velocity=}, {accel=}")
                     bus.flush()  # optimization attempt
                     bus.send(axis2canid(axis), "move", [direction, abs(adjusted_speed), accel])
                     # bus.ask(axis2canid(axis), "move", [direction, abs(adjusted_speed), accel], answer_pattern=[None])
-                    planned_speeds[axis] = adjusted_speed
-                    planned_positions[axis] = curr_pos
+                    # TODO: the following makes the movement look smoother, but makes it less precise (drift possible)
+                    if current_trajectory is not None:
+                        planned_speeds[axis] = adjusted_speed
+                        planned_positions[axis] = curr_pos
 
                 # Stop all axes after a short while if no movement is planned
                 if current_trajectory is None and (last_stop_time - elapsed_time)*60 >= 1.0:
