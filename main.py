@@ -445,8 +445,8 @@ def init(axis, bus=None):
     bus.ask(can_id, "set_shaft_lock", [True], answer_pattern=[None])
     bus.ask(can_id, "release_shaft_lock", answer_pattern=[None])
     bus.ask(can_id, "set_work_current", [arm.AXES_CURRENT_LIMIT[axis]], answer_pattern=[True])
-    # bus.ask(can_id, "set_work_mode", [arm.AXES_WORK_MODE[axis]], answer_pattern=[True])  # TODO: CFG
-    # bus.ask(can_id, "set_direction", [arm.AXES_DIRECTION[axis]], answer_pattern=[True])  # TODO: CFG
+    bus.ask(can_id, "set_work_mode", [arm.AXES_WORK_MODE[axis]], answer_pattern=[True])
+    bus.ask(can_id, "set_direction", [arm.AXES_DIRECTION[axis]], answer_pattern=[True])
     # bus.ask(can_id, "set_zero", answer_pattern=[1])
     global state
     state[axis] = STOPPED
