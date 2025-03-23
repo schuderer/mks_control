@@ -593,11 +593,11 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
         update_all_motor_info(bus)
         while True:
             # TODO: catch and handle non-fatal errors on this level
-            if (elapsed_time - last_heartbeat) * 60 >= 1.0:  # TODO (should be every 10 seconds or so eventually)
+            if (elapsed_time - last_heartbeat) * 60 >= 1.0:
                 print(f"Motion controller: Heartbeat {60*dt=}, {elapsed_time=}, {planned_positions=}, {planned_speeds=}, {current_trajectory=}, {motion_conn=}")
                 last_heartbeat = elapsed_time
 
-            if (elapsed_time - last_info_update) * 60 >= 1.1:  # TODO: make sure that main program maintains its own always-up-to-date motor state
+            if (elapsed_time - last_info_update) * 60 >= 1.1:
                 if not control_loop_active:
                     update_motor_angles(bus)  # Gets updated by the loop itself, saves one transaction per device
                 update_motor_states(bus)
@@ -613,7 +613,6 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
             check_next_trajectory()
 
             # Get the next trajectory if there is none or the previous one has ended
-            # if current_trajectory is None:  # TODO: should this also work if a trajectory is running?
             if message_waiting or controller_conn.poll():  # got a message via the control connection
                 item = controller_conn.recv()  # Todo: change to movement (including speeds) (how to interpolate then?)
                 protocol: str = item and str(item.get('protocol')).lower()
@@ -716,6 +715,7 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
                     # Calculate the PID error
                     pid_error = pid[axis](planned_position, curr_pos,
                                           dt * 60)  # *60 is just arbitrary scaling to have sensible PID values
+                    # TODO: check whether pid_error is under epsilon, only do corrections if necessary
                     # print(f"{elapsed_time=}, {axis=}: {curr_pos=}, {planned_position=}, {dt=}, {planned_position-curr_pos=}, {pid_error=}")
 
                     adjusted_speed = planned_speed_mixin * planned_speed + (1 - planned_speed_mixin) * pid_error
@@ -723,7 +723,7 @@ def control_trajectory(controller_conn: Connection, bus_args: dict):
                     if abs(adjusted_speed) < speed_threshold:
                         adjusted_speed = 0
                     direction = 1 if adjusted_speed > 0 else 0
-                    direction = 1 - direction if arm.AXES_RAW_DIRECTION[axis] else direction
+                    # direction = 1 - direction if arm.AXES_RAW_DIRECTION[axis] else direction  # TODO still necessary?                    accel = arm.AXES_ACCEL_LIMIT[axis]
                     accel = arm.AXES_ACCEL_LIMIT[axis]
                     # print(f"Axis {axis}: {direction=}, {adjusted_velocity=}, {accel=}")
                     bus.flush()  # optimization attempt
