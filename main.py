@@ -35,6 +35,7 @@ ACTIONS = {
         "home_axis":  (lambda axis: home(axis), HOMING),
         "home_all":   (lambda _: home_all(zero_pose=arm.MOVE_ZERO_AFTER_HOME), HOMING),
         "play_pause": (lambda _: play_pause(), PLAYBACK),
+        "print_sequence": (lambda _: print_sequence(), STOPPED),
         "input":      (lambda axis: input_angle(axis), STOPPED),
         "go_to_saved_position":      (lambda axis: go_to_saved_position(), STOPPED),
         "move_all_to_zero": (lambda _: move_to_motor_position(motor_angles_abs([0] * arm.NUM_AXES), bus=current_bus_proxy.get()), STOPPED),
@@ -129,6 +130,8 @@ def on_release(key):
         save_position()
     if key == keyboard.KeyCode.from_char('p'):
         next_command[active_axis] = "play_pause"
+    if key == keyboard.KeyCode.from_char('P'):
+        next_command[active_axis] = "print_sequence"
     if key == keyboard.KeyCode.from_char('c'):
         print("Clearing position sequence")
         time.sleep(0.5)
@@ -232,6 +235,15 @@ def check_stopped(axis, bus=None):
     (motor_status_code,) = bus.ask(axis2canid(axis), "motor_status", timeout=5.0)
     if motor_status_code == 1:
         state[axis] = STOPPED
+
+
+def print_sequence():
+    global sequence
+    if len(sequence) == 0:
+        print(f"Demo sequence: {arm.ARM_DEMO_SEQUENCE}")
+    else:
+        print(f"Current sequence: {sequence}")
+    exit(0)
 
 def play_pause(bus=None):
     bus = bus or current_bus_proxy.get()
@@ -467,7 +479,7 @@ def main():
                     print(f"'l' to release lock, 'L' to release all locks, 'h' to home axis, 'H' to home all axes.")
                     print(f"'0' to move to zero pose, 'z' to zero axis, 'enter' to input angle for current axis.")
                     print(f"'s' to save position in sequence, 'p' to play/pause sequence, 'c' to clear sequence,")
-                    print(f"'g' to go to saved position.")
+                    print(f"'g' to go to saved position, 'P' to print sequence and exit.")
                     print_axes()
                     print("\n\n")
                     execute_transitions(bus=bus)
