@@ -317,7 +317,7 @@ def home(axis, bus=None):
                 arm.AXES_ENDSTOP_TRIGGER[axis],
                 arm.AXES_HOMING_DIRECTION[axis],
                 arm.AXES_HOMING_SPEED[axis],
-                1,  # 1 = enable endstop homing, 0 = disable
+                1-arm.AXIS_INFINITE[axis],  # 1 = enable endstop homing, 0 = disable
             ], answer_pattern=[True])
             bus.ask(can_id, "home", answer_pattern=[1])  # 1 = has started
             bus.wait_for(can_id, "home", timeout=arm.AXES_MOVE_TIMEOUT[axis], value_pattern=[2])
