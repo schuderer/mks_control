@@ -91,11 +91,12 @@ HOMING_START_MACRO = [None, None, None, None, None, None]  # Macros to run befor
 HOMING_END_MACRO = [None, None, None, None, None, None]  # Macros to run after homing each axis (None = no macro)
 HOMING_START_MACRO[5] = [
     # Move mirror axis in opposite direction
-    [4, "move", 1-AXES_HOMING_DIRECTION[5], AXES_HOMING_SPEED[4], AXES_ACCEL_LIMIT[4]],
+    # [axis, cmd, params, optional_answer_pattern]
+    [4, "move", [1-AXES_HOMING_DIRECTION[5], AXES_HOMING_SPEED[4], AXES_ACCEL_LIMIT[4]], None],
 ]
 HOMING_END_MACRO[5] = [
-    # Stop moving mirror axis
-    [4, "move", 1-AXES_HOMING_DIRECTION[5], 0, AXES_ACCEL_LIMIT[4]],
+    # Stop moving mirror axis and wait for stop (2)
+    [4, "move", [1-AXES_HOMING_DIRECTION[5], 0, AXES_ACCEL_LIMIT[4]], [2]],
 ]
 
 # Others

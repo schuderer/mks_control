@@ -737,7 +737,7 @@ class Bus:
         `can_id_or_msg` (it is returned by the `send` method), and it will match the CAN ID and command.
 
         :param can_id_or_msg: Either a CAN ID (int) or a complete Message object.
-        :param cmd: The command to wait for for this CAN ID (not needed when a message object is provided).
+        :param cmd: The command to wait for this CAN ID (not needed when a message object is provided).
         :param value_pattern: Optional: A list or tuple of values to match in the message data.
                                         If not None, the message data must match all values in the tuple (logical AND).
                                         None-entries in the pattern are ignored.
