@@ -87,6 +87,16 @@ AXES_SAFE_HOMING_ANGLE = [AXES_ANGLE_RANGE[i] * factor for i, factor in enumerat
 # order in which to home the axes (homing 3 twice to prevent collisions at first and to make it look neat in the end)
 HOMING_ORDER = [5, 4, 3, 2, 1, 0, 3]
 MOVE_ZERO_AFTER_HOME = False # move to zero position after homing
+HOMING_START_MACRO = [None, None, None, None, None, None]  # Macros to run before homing each axis (None = no macro)
+HOMING_END_MACRO = [None, None, None, None, None, None]  # Macros to run after homing each axis (None = no macro)
+HOMING_START_MACRO[5] = [
+    # Move mirror axis in opposite direction
+    [4, "move", 1-AXES_HOMING_DIRECTION[5], AXES_HOMING_SPEED[4], AXES_ACCEL_LIMIT[4]],
+]
+HOMING_END_MACRO[5] = [
+    # Stop moving mirror axis
+    [4, "move", 1-AXES_HOMING_DIRECTION[5], 0, AXES_ACCEL_LIMIT[4]],
+]
 
 # Others
 # Move arm left-right

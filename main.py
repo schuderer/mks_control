@@ -329,11 +329,25 @@ def home(axis, bus=None):
                 arm.AXES_ENDSTOP_TRIGGER[axis],
                 arm.AXES_HOMING_DIRECTION[axis],
                 arm.AXES_HOMING_SPEED[axis],
-                1-arm.AXIS_INFINITE[axis],  # 1 = enable endstop homing, 0 = disable
+                1-arm.AXIS_INFINITE[axis],  # axis may or may not move beyond endstop
             ], answer_pattern=[True])
+
+            if arm.HOMING_START_MACRO[axis]:
+                print(f"Executing pre-home macro for axis {axis}")
+                for macro in arm.HOMING_START_MACRO[axis]:
+                    ax, cmd, *params = macro
+                    bus.send(axis2canid(ax), cmd, params)
+
             bus.ask(can_id, "home", answer_pattern=[1])  # 1 = has started
             bus.wait_for(can_id, "home", timeout=arm.AXES_MOVE_TIMEOUT[axis], value_pattern=[2])
             bus.ask(can_id, "set_zero", answer_pattern=[True])  # this should not be necessary, but it is :(
+
+            if arm.HOMING_END_MACRO[axis]:
+                print(f"Executing post-home macro for axis {axis}")
+                for macro in arm.HOMING_END_MACRO[axis]:
+                    ax, cmd, *params = macro
+                    bus.send(axis2canid(ax), cmd, params)
+
         except TimeoutError as e:
             raise HomingError(f"Endstop homing of axis {axis} timed out. {e}"
                               f"Consider increasing AXES_MOVE_TIMEOUT for axis {axis}.")
