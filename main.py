@@ -335,19 +335,18 @@ def home(axis, bus=None):
             if arm.HOMING_START_MACRO[axis]:
                 print(f"Executing pre-home macro for axis {axis}")
                 for macro in arm.HOMING_START_MACRO[axis]:
-                    ax, cmd, *params, answer_pattern = macro
-                    bus.ask(axis2canid(ax), cmd, *params, answer_pattern=answer_pattern)
+                    ax, cmd, params, answer_pattern = macro
+                    bus.ask(axis2canid(ax), cmd, params, answer_pattern=answer_pattern, timeout=arm.AXES_MOVE_TIMEOUT[ax])
 
             bus.ask(can_id, "home", answer_pattern=[1])  # 1 = has started
             bus.wait_for(can_id, "home", timeout=arm.AXES_MOVE_TIMEOUT[axis], value_pattern=[2])
+            bus.ask(can_id, "set_zero", answer_pattern=[True])  # this should not be necessary, but it is :(
 
             if arm.HOMING_END_MACRO[axis]:
                 print(f"Executing post-home macro for axis {axis}")
                 for macro in arm.HOMING_END_MACRO[axis]:
-                    ax, cmd, *params, answer_pattern = macro
-                    bus.ask(axis2canid(ax), cmd, *params, answer_pattern=answer_pattern)
-
-            bus.ask(can_id, "set_zero", answer_pattern=[True])  # this should not be necessary, but it is :(
+                    ax, cmd, params, answer_pattern = macro
+                    bus.ask(axis2canid(ax), cmd, params, answer_pattern=answer_pattern, timeout=arm.AXES_MOVE_TIMEOUT[ax])
 
         except TimeoutError as e:
             raise HomingError(f"Endstop homing of axis {axis} timed out. {e}"
